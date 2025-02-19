@@ -141,6 +141,9 @@ private:
   std::string getImportName(bool asLib);
 
   void createImportLibrary(bool asLib);
+  // <COFF_LARGE_EXPORTS>
+  void createLargeImportLibrary(bool asLib);
+  // </COFF_LARGE_EXPORTS>
 
   void parseModuleDefs(StringRef path);
 
@@ -264,6 +267,9 @@ private:
   Export parseExport(StringRef arg);
   void fixupExports();
   void assignExportOrdinals();
+  // <COFF_LARGE_EXPORTS>
+  void validateLargeExports();
+  // </COFF_LARGE_EXPORTS>
 
   // Parses a string in the form of "key=value" and check
   // if value matches previous values for the key.

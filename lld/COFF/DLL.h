@@ -35,6 +35,53 @@ public:
   std::vector<Chunk *> auxIatCopy;
 };
 
+// <COFF_LARGE_EXPORTS>
+class LargeIdataContents {
+public:
+  void add(DefinedLargeImport *sym) { imports.push_back(sym); }
+  bool empty() { return imports.empty(); }
+
+  void createLoaderImports(COFFLinkerContext &ctx, int maxLoadOrder);
+  ImportFile *createLoaderImport(COFFLinkerContext &ctx, StringRef symbolName);
+  void createLargeLoaderDllImport(COFFLinkerContext &ctx, StringRef dllName);
+  void buildSectionContents(COFFLinkerContext &ctx);
+  void createRegisterInitializerChunk(COFFLinkerContext &ctx);
+  void createUnregisterTerminatorChunk(COFFLinkerContext &ctx);
+  void createLinkInitializerChunk(COFFLinkerContext &ctx);
+
+  std::vector<std::unique_ptr<MemoryBuffer>> loaderImportData;
+  std::vector<std::unique_ptr<MemoryBuffer>> dllImportData;
+  ImportFile* loaderInitializeExportsImportFile{};
+  ImportFile* loaderTerminateExportsImportFile{};
+  ImportFile* loaderLinkImportsImportFile{};
+  std::map<StringRef, ImportFile*> dllImportFiles;
+  std::vector<StringRef> importedDllNames;
+  std::map<StringRef, size_t> importedDllNameToExportSectionIndex;
+  std::vector<DefinedLargeImport *> imports;
+  Chunk *sectionHeaderChunk{};
+  Chunk *exportsSectionHeaderChunk{};
+  std::vector<Chunk *> textChunks;
+  std::vector<Chunk *> initializerChunks;
+  std::vector<Chunk *> terminatorChunks;
+
+  std::vector<Chunk *> addressTableChunks;
+  std::vector<Chunk *> importedExportSectionChunks;
+  std::vector<Chunk *> importChunks;
+  std::vector<Chunk *> nameChunks;
+};
+
+class LargeEdataContents {
+public:
+  LargeEdataContents(COFFLinkerContext &ctx);
+
+  Chunk *sectionHeaderChunk{};
+  std::vector<Chunk *> exportRVATableChunks;
+  std::vector<Chunk *> exportHashBucketTableChunks;
+  std::vector<Chunk *> exportTableChunks;
+  std::vector<Chunk *> nameChunks;
+};
+// </COFF_LARGE_EXPORTS>
+
 // Windows-specific.
 // DelayLoadContents creates all chunks for the delay-load DLL import table.
 class DelayLoadContents {

@@ -21,7 +21,9 @@ add_lld_library(lldCOFF
   SymbolTable.cpp
   Symbols.cpp
   Writer.cpp
-
+  # <COFF_LARGE_EXPORTS> Added CityHash to dependencies
+  CityHash.cpp
+  # </COFF_LARGE_EXPORTS>
   LINK_COMPONENTS
   ${LLVM_TARGETS_TO_BUILD}
   BinaryFormat

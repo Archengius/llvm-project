@@ -19,6 +19,9 @@
 #include "llvm/Object/ObjectFile.h"
 #include "llvm/Support/Error.h"
 #include "llvm/Support/ErrorHandling.h"
+// <COFF_LARGE_EXPORTS>
+#include "llvm/Object/COFFLargeImportFile.h"
+// </COFF_LARGE_EXPORTS>
 #include <memory>
 
 using namespace llvm;
@@ -71,6 +74,10 @@ SymbolicFile::createSymbolicFile(MemoryBufferRef Object, file_magic Type,
     return ObjectFile::createObjectFile(Object, Type, InitContent);
   case file_magic::coff_import_library:
     return std::unique_ptr<SymbolicFile>(new COFFImportFile(Object));
+  // <COFF_LARGE_EXPORTS>
+  case file_magic::coff_large_import_library:
+    return std::unique_ptr<SymbolicFile>(new COFFLargeImportFile(Object));
+  // </COFF_LARGE_EXPORTS>
   case file_magic::elf_relocatable:
   case file_magic::macho_object:
   case file_magic::coff_object: {
@@ -123,6 +130,9 @@ bool SymbolicFile::isSymbolicFile(file_magic Type, const LLVMContext *Context) {
   case file_magic::elf_relocatable:
   case file_magic::macho_object:
   case file_magic::coff_object:
+  // <COFF_LARGE_EXPORTS>
+  case file_magic::coff_large_import_library:
+  // <COFF_LARGE_EXPORTS>
     return true;
   default:
     return false;

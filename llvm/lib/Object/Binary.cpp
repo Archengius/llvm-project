@@ -70,6 +70,9 @@ Expected<std::unique_ptr<Binary>> object::createBinary(MemoryBufferRef Buffer,
   case file_magic::macho_file_set:
   case file_magic::coff_object:
   case file_magic::coff_import_library:
+  // <COFF_LARGE_EXPORTS>
+  case file_magic::coff_large_import_library:
+  // </COFF_LARGE_EXPORTS>
   case file_magic::pecoff_executable:
   case file_magic::bitcode:
   case file_magic::xcoff_object_32:

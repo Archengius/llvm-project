@@ -54,6 +54,8 @@ typedef enum {
   LLVMBinaryTypeMachO64B,             /**< MachO 64-bit, big endian. */
   LLVMBinaryTypeWasm,                 /**< Web Assembly. */
   LLVMBinaryTypeOffload,              /**< Offloading fatbinary. */
+  // <COFF_LARGE_EXPORTS>
+  LLVMBinaryTypeCOFFLargeImportFile,  /** COFF Large Import file */
 
 } LLVMBinaryType;
 

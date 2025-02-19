@@ -4,6 +4,9 @@ add_llvm_component_library(LLVMObject
   Binary.cpp
   BuildID.cpp
   COFFImportFile.cpp
+  # <COFF_LARGE_EXPORTS>
+  COFFLargeImportFile.cpp
+  # </COFF_LARGE_EXPORTS>
   COFFModuleDefinition.cpp
   COFFObjectFile.cpp
   Decompressor.cpp

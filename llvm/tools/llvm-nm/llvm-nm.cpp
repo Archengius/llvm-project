@@ -51,6 +51,9 @@
 #include "llvm/Support/raw_ostream.h"
 #include "llvm/TargetParser/Host.h"
 #include "llvm/TargetParser/Triple.h"
+// <COFF_LARGE_EXPORTS>
+#include "llvm/Object/COFFLargeImportFile.h"
+// </COFF_LARGE_EXPORTS>
 #include <vector>
 
 using namespace llvm;
@@ -1011,6 +1014,18 @@ static char getSymbolNMTypeChar(COFFImportFile &Obj) {
   return '?';
 }
 
+// <COFF_LARGE_EXPORTS>
+static char getSymbolNMTypeChar(COFFLargeImportFile &Obj) {
+  switch (Obj.getCOFFLargeImportHeader()->Type) {
+  case LARGE_LOADER_IMPORT_TYPE_CODE:
+    return 't';
+  case LARGE_LOADER_IMPORT_TYPE_DATA:
+    return 'd';
+  }
+  return '?';
+}
+// </COFF_LARGE_EXPORTS>
+
 static char getSymbolNMTypeChar(MachOObjectFile &Obj, basic_symbol_iterator I) {
   DataRefImpl Symb = I->getRawDataRefImpl();
   uint8_t NType = Obj.is64Bit() ? Obj.getSymbol64TableEntry(Symb).n_type
@@ -1161,6 +1176,10 @@ static char getNMSectionTagAndName(SymbolicFile &Obj, basic_symbol_iterator I,
     Ret = getSymbolNMTypeChar(*XCOFF, I);
   else if (COFFImportFile *COFFImport = dyn_cast<COFFImportFile>(&Obj))
     Ret = getSymbolNMTypeChar(*COFFImport);
+  // <COFF_LARGE_EXPORTS>
+  else if (COFFLargeImportFile *COFFLargeImport = dyn_cast<COFFLargeImportFile>(&Obj))
+    Ret = getSymbolNMTypeChar(*COFFLargeImport);
+  // </COFF_LARGE_EXPORTS>
   else if (MachOObjectFile *MachO = dyn_cast<MachOObjectFile>(&Obj))
     Ret = getSymbolNMTypeChar(*MachO, I);
   else if (WasmObjectFile *Wasm = dyn_cast<WasmObjectFile>(&Obj))

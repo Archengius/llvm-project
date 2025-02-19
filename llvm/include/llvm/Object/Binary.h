@@ -42,6 +42,9 @@ protected:
     ID_Archive,
     ID_MachOUniversalBinary,
     ID_COFFImportFile,
+    // <COFF_LARGE_EXPORTS>
+    ID_COFFLargeImportFile, // Import file generated when using Large Exports to allow exporting more than 65k symbols from COFF files
+    // </COFF_LARGE_EXPORTS>
     ID_IR,            // LLVM IR
     ID_TapiUniversal, // Text-based Dynamic Library Stub file.
     ID_TapiFile,      // Text-based Dynamic Library Stub file.
@@ -109,7 +112,9 @@ public:
   }
 
   bool isSymbolic() const {
-    return isIR() || isObject() || isCOFFImportFile() || isTapiFile();
+    // <COFF_LARGE_EXPORTS>
+    return isIR() || isObject() || isCOFFImportFile() || isTapiFile() || IsLargeCOFFImportFile();
+    // </COFF_LARGE_EXPORTS>
   }
 
   bool isArchive() const { return TypeID == ID_Archive; }
@@ -141,6 +146,11 @@ public:
   bool isCOFFImportFile() const {
     return TypeID == ID_COFFImportFile;
   }
+  // <COFF_LARGE_EXPORTS>
+  bool IsLargeCOFFImportFile() const {
+    return TypeID == ID_COFFLargeImportFile;
+  }
+  // </COFF_LARGE_EXPORTS>
 
   bool isIR() const {
     return TypeID == ID_IR;

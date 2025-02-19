@@ -30,6 +30,7 @@
 #include "llvm/LTO/LTO.h"
 #include "llvm/Object/ArchiveWriter.h"
 #include "llvm/Object/COFFImportFile.h"
+#include "llvm/Object/COFFLargeImport.h"
 #include "llvm/Object/COFFModuleDefinition.h"
 #include "llvm/Option/Arg.h"
 #include "llvm/Option/ArgList.h"
@@ -284,6 +285,15 @@ void LinkerDriver::addArchiveBuffer(MemoryBufferRef mb, StringRef symName,
     ctx.symtab.addFile(imp);
     return;
   }
+  // <COFF_LARGE_EXPORTS>
+  // Parse large import library since it does not follow a traditional COFF object/import library format
+  if (magic == file_magic::coff_large_import_library) {
+    LargeImportFile *imp = make<LargeImportFile>(ctx, mb);
+    imp->parentName = parentName;
+    ctx.symtab.addFile(imp);
+    return;
+  }
+  // </COFF_LARGE_EXPORTS>
 
   InputFile *obj;
   if (magic == file_magic::coff_object) {
@@ -1005,6 +1015,73 @@ void LinkerDriver::createImportLibrary(bool asLib) {
   }
 }
 
+// <COFF_LARGE_EXPORTS>
+static const char LargeImportFileSignature[8] = {'!', '<', 'l', 'i', 'm', 'p', '>', '\n'}; // !<limp>\n
+
+void LinkerDriver::createLargeImportLibrary(bool asLib) {
+  llvm::TimeTraceScope timeScope("Create large import library");
+
+  std::string libName = path::filename(getImportName(asLib)).str();
+  BumpPtrAllocator localAllocator;
+  std::vector<NewArchiveMember> importMembers;
+
+  // Generate large import archive members for each export we have
+  for (Export &exp : ctx.config.exports) {
+
+    // Skip over private and constant exports
+    if (exp.isPrivate || exp.constant) continue;
+
+    size_t totalImportSize = sizeof(COFFLargeImportHeader) + exp.name.size() + (ctx.config.forceNoDllNameInLib ? 0 : libName.size());
+    char *importBufferStart = localAllocator.Allocate<char>(totalImportSize);
+
+    auto *hdr = reinterpret_cast<COFFLargeImportHeader *>(importBufferStart);
+    memcpy(hdr->Signature, LargeImportFileSignature, sizeof(hdr->Signature));
+    hdr->Machine = ctx.config.machine;
+    hdr->Version = 1;
+    hdr->Type = exp.data ? LARGE_LOADER_IMPORT_TYPE_DATA : LARGE_LOADER_IMPORT_TYPE_CODE;
+    hdr->Flags = LARGE_LOADER_IMPORT_FLAGS_NONE;
+    hdr->SizeOfSymbolName = exp.name.size();
+    hdr->SizeOfDllNameHint = ctx.config.forceNoDllNameInLib ? 0 : libName.size();
+
+    memcpy(importBufferStart + sizeof(COFFLargeImportHeader), exp.name.data(), exp.name.size());
+    memcpy(importBufferStart + sizeof(COFFLargeImportHeader) + exp.name.size(), libName.data(), ctx.config.forceNoDllNameInLib ? 0 : libName.size());
+
+    importMembers.push_back(NewArchiveMember(MemoryBufferRef(StringRef(importBufferStart, totalImportSize), libName)));
+  }
+
+  std::string path = getImplibPath();
+  if (!ctx.config.incremental) {
+    checkError(writeArchive(path, importMembers, SymtabWritingMode::NormalSymtab, Archive::K_COFF, true, false));
+    return;
+  }
+
+  // If the import library already exists, replace it only if the contents
+  // have changed.
+  ErrorOr<std::unique_ptr<MemoryBuffer>> oldBuf = MemoryBuffer::getFile(path, /*IsText=*/false, /*RequiresNullTerminator=*/false);
+  if (!oldBuf) {
+    checkError(writeArchive(path, importMembers, SymtabWritingMode::NormalSymtab, Archive::K_COFF, true, false));
+    return;
+  }
+
+  SmallString<128> tmpName;
+  if (std::error_code ec = sys::fs::createUniqueFile(path + ".tmp-%%%%%%%%.lib", tmpName))
+    fatal("cannot create temporary file for import library " + path + ": " + ec.message());
+
+  if (Error e = writeArchive(tmpName, importMembers, SymtabWritingMode::NormalSymtab, Archive::K_COFF, true, false)) {
+    checkError(std::move(e));
+    return;
+  }
+
+  std::unique_ptr<MemoryBuffer> newBuf = check(MemoryBuffer::getFile(tmpName, /*IsText=*/false, /*RequiresNullTerminator=*/false));
+  if ((*oldBuf)->getBuffer() != newBuf->getBuffer()) {
+    oldBuf->reset();
+    checkError(errorCodeToError(sys::fs::rename(tmpName, path)));
+  } else {
+    sys::fs::remove(tmpName);
+  }
+}
+// </COFF_LARGE_EXPORTS>
+
 void LinkerDriver::parseModuleDefs(StringRef path) {
   llvm::TimeTraceScope timeScope("Parse def file");
   std::unique_ptr<MemoryBuffer> mb =
@@ -1538,6 +1615,12 @@ void LinkerDriver::linkerMain(ArrayRef<const char *> argsArr) {
     timeTraceProfilerInitialize(config->timeTraceGranularity, argsArr[0]);
 
   llvm::TimeTraceScope timeScope("COFF link");
+
+  // <COFF_LARGE_EXPORTS>
+  config->largeExports = args.hasArg(OPT_COFF_LARGE_EXPORTS);
+  config->forceNoDllNameInLib = args.hasArg(OPT_COFF_WILDCARD_IMPORT_LIB);
+  config->autoWildcardImport = args.hasArg(OPT_COFF_AUTO_WILDCARD_IMPORT);
+  // </COFF_LARGE_EXPORTS>
 
   // Parse and evaluate -mllvm options.
   std::vector<const char *> v;
@@ -2322,7 +2405,14 @@ void LinkerDriver::linkerMain(ArrayRef<const char *> argsArr) {
   if (!args.hasArg(OPT_INPUT, OPT_wholearchive_file)) {
     fixupExports();
     if (!config->noimplib)
-      createImportLibrary(/*asLib=*/true);
+      // <COFF_LARGE_EXPORTS> Handle import library generation for large exports
+      if (config->largeExports) {
+        validateLargeExports();
+        createLargeImportLibrary(true);
+      }
+      else
+        createImportLibrary(/*asLib=*/true);
+      // </COFF_LARGE_EXPORTS>
     return;
   }
 
@@ -2490,6 +2580,11 @@ void LinkerDriver::linkerMain(ArrayRef<const char *> argsArr) {
     if (ctx.symtab.findUnderscore("__buildid"))
       ctx.symtab.addUndefined(mangle("__buildid"));
 
+  // <COFF_LARGE_EXPORTS> Add synthetic symbol for the base of large loader exports. It will be defined later when large exports section is written
+  if (config->largeExports)
+    ctx.symtab.addUndefined("__large_loader_exports_base");
+  // </COFF_LARGE_EXPORTS>
+
   // This code may add new undefined symbols to the link, which may enqueue more
   // symbol resolution tasks, so we need to continue executing tasks until we
   // converge.
@@ -2583,6 +2678,13 @@ void LinkerDriver::linkerMain(ArrayRef<const char *> argsArr) {
     ctx.symtab.loadMinGWSymbols();
     run();
   }
+  // <COFF_LARGE_EXPORTS>
+  if (config->autoWildcardImport) {
+    // Resolve any undefined __imp symbols by creating synthetic symbols pointing to wildcard large imports
+    // Note that we do not need run() here since no new object files will be created, only the symbols that contain all of the relevant data inline
+    ctx.symtab.resolveUndefinedWildcardImportSymbols();
+  }
+  // </COFF_LARGE_EXPORTS>
 
   // At this point, we should not have any symbols that cannot be resolved.
   // If we are going to do codegen for link-time optimization, check for
@@ -2658,9 +2760,16 @@ void LinkerDriver::linkerMain(ArrayRef<const char *> argsArr) {
   if (!config->exports.empty() || config->dll) {
     llvm::TimeTraceScope timeScope("Create .lib exports");
     fixupExports();
-    if (!config->noimplib && (!config->mingw || !config->implib.empty()))
-      createImportLibrary(/*asLib=*/false);
-    assignExportOrdinals();
+    // <COFF_LARGE_EXPORTS> Handle large import library generation
+    if (config->largeExports) {
+      validateLargeExports();
+      createLargeImportLibrary(false);
+    } else {
+      if (!config->noimplib && (!config->mingw || !config->implib.empty()))
+        createImportLibrary(/*asLib=*/false);
+      assignExportOrdinals();
+    }
+    // </COFF_LARGE_EXPORTS>
   }
 
   // Handle /output-def (MinGW specific).

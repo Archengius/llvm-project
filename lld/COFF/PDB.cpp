@@ -1137,6 +1137,12 @@ static pdb::BulkPublic createPublic(COFFLinkerContext &ctx, Defined *def) {
   } else if (isa<DefinedImportThunk>(def)) {
     flags = PublicSymFlags::Function;
   }
+  // <COFF_LARGE_EXPORTS>
+  // Treat large import thunks as public function symbols
+  else if (isa<DefinedLargeImportThunk>(def)) {
+    flags = PublicSymFlags::Function;
+  }
+  // </COFF_LARGE_EXPORTS>
   pub.setFlags(flags);
 
   OutputSection *os = ctx.getOutputSection(def->getChunk());

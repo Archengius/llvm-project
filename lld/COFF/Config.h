@@ -322,6 +322,11 @@ struct Configuration {
   bool thinLTOEmitImportsFiles;
   bool thinLTOIndexOnly;
   bool timeTraceEnabled = false;
+  // <COFF_LARGE_EXPORTS>
+  bool largeExports = false; // Determines whenever large exports generation is enabled
+  bool forceNoDllNameInLib = false; // True if we should not emit a DLL hint when generating an import library for our exports
+  bool autoWildcardImport = false; // True if we should automatically create wildcard large imports for any undefined imported symbols
+  // </COFF_LARGE_EXPORTS>
   bool autoImport = false;
   bool pseudoRelocs = false;
   bool stdcallFixup = false;

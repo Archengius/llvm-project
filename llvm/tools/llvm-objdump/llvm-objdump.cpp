@@ -81,6 +81,9 @@
 #include "llvm/Support/raw_ostream.h"
 #include "llvm/TargetParser/Host.h"
 #include "llvm/TargetParser/Triple.h"
+// <COFF_LARGE_EXPORTS>
+#include "llvm/Object/COFFLargeImportFile.h"
+// </COFF_LARGE_EXPORTS>
 #include <algorithm>
 #include <cctype>
 #include <cstring>
@@ -3358,6 +3361,25 @@ static void dumpObject(const COFFImportFile *I, const Archive *A,
     printCOFFSymbolTable(*I);
 }
 
+// <COFF_LARGE_EXPORTS>
+static void dumpObject(const COFFLargeImportFile *I, const Archive *A,
+                       const Archive::Child *C = nullptr) {
+  StringRef ArchiveName = A ? A->getFileName() : "";
+
+  // Avoid other output when using a raw option.
+  if (!RawClangAST)
+    outs() << '\n'
+           << ArchiveName << "(" << I->getFileName() << ")"
+           << ":\tfile format COFF-large-import-file"
+           << "\n\n";
+
+  if (ArchiveHeaders && !MachOOpt && C)
+    printArchiveChild(ArchiveName, *C);
+  if (SymbolTable)
+    printCOFFSymbolTable(*I);
+}
+// </COFF_LARGE_EXPORTS>
+
 /// Dump each object file in \a a;
 static void dumpArchive(const Archive *A) {
   Error Err = Error::success();
@@ -3373,6 +3395,8 @@ static void dumpArchive(const Archive *A) {
     if (ObjectFile *O = dyn_cast<ObjectFile>(&*ChildOrErr.get()))
       dumpObject(O, A, &C);
     else if (COFFImportFile *I = dyn_cast<COFFImportFile>(&*ChildOrErr.get()))
+      dumpObject(I, A, &C);
+    else if (COFFLargeImportFile *I = dyn_cast<COFFLargeImportFile>(&*ChildOrErr.get()))
       dumpObject(I, A, &C);
     else
       reportError(errorCodeToError(object_error::invalid_file_type),

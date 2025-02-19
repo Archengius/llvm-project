@@ -25,6 +25,9 @@
 #include "llvm/Support/Win64EH.h"
 #include "llvm/Support/WithColor.h"
 #include "llvm/Support/raw_ostream.h"
+// <COFF_LARGE_EXPORTS>
+#include "llvm/Object/COFFLargeImportFile.h"
+// </COFF_LARGE_EXPORTS>
 
 using namespace llvm;
 using namespace llvm::objdump;
@@ -836,6 +839,31 @@ void objdump::printCOFFSymbolTable(const object::COFFImportFile &i) {
     ++Index;
   }
 }
+
+// <COFF_LARGE_EXPORTS>
+void objdump::printCOFFSymbolTable(const object::COFFLargeImportFile &i) {
+  unsigned Index = 0;
+  bool IsCode = i.getCOFFLargeImportHeader()->Type == LARGE_LOADER_IMPORT_TYPE_CODE;
+
+  for (const object::BasicSymbolRef &Sym : i.symbols()) {
+    std::string Name;
+    raw_string_ostream NS(Name);
+
+    cantFail(Sym.printName(NS));
+    NS.flush();
+
+    outs() << "[" << format("%2d", Index) << "]"
+           << "(sec " << format("%2d", 0) << ")"
+           << "(fl 0x00)" // Flag bits, which COFF doesn't have.
+           << "(ty " << format("%3x", (IsCode && Index) ? 32 : 0) << ")"
+           << "(scl " << format("%3x", 0) << ") "
+           << "(nx " << 0 << ") "
+           << "0x" << format("%08x", 0) << " " << Name << '\n';
+
+    ++Index;
+  }
+}
+// </COFF_LARGE_EXPORTS>
 
 void objdump::printCOFFSymbolTable(const COFFObjectFile &coff) {
   for (unsigned SI = 0, SE = coff.getNumberOfSymbols(); SI != SE; ++SI) {

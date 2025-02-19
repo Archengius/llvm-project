@@ -409,6 +409,13 @@ Error StaticLibraryDefinitionGenerator::buildObjectFilesMap() {
         Excluded.insert(DataOffset);
         continue;
       }
+      // <COFF_LARGE_EXPORTS>
+      if ((*Child)->IsLargeCOFFImportFile()) {
+        ImportedDynamicLibraries.insert((*Child)->getFileName().str());
+        Excluded.insert(DataOffset);
+        continue;
+      }
+      // </COFF_LARGE_EXPORTS>
 
       // Give members of the archive a name that contains the archive path so
       // that they can be differentiated from a member with the same name in a

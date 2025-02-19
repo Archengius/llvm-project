@@ -24,6 +24,9 @@ namespace llvm {
 namespace object {
 class Archive;
 class COFFImportFile;
+// <COFF_LARGE_EXPORTS>
+class COFFLargeImportFile;
+// </COFF_LARGE_EXPORTS>
 class ObjectFile;
 class XCOFFObjectFile;
 class ELFObjectFileBase;
@@ -216,6 +219,10 @@ std::unique_ptr<ObjDumper> createXCOFFDumper(const object::XCOFFObjectFile &Obj,
 
 void dumpCOFFImportFile(const object::COFFImportFile *File,
                         ScopedPrinter &Writer);
+// <COFF_LARGE_EXPORTS>
+void dumpCOFFLargeImportFile(const object::COFFLargeImportFile *File,
+                        ScopedPrinter &Writer);
+// </COFF_LARGE_EXPORTS>
 
 void dumpCodeViewMergedTypes(ScopedPrinter &Writer,
                              ArrayRef<ArrayRef<uint8_t>> IpiRecords,

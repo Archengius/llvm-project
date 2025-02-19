@@ -70,6 +70,11 @@ void SymbolTable::addFile(InputFile *file) {
     } else if (auto *f = dyn_cast<ImportFile>(file)) {
       ctx.importFileInstances.push_back(f);
     }
+    // <COFF_LARGE_EXPORTS>
+    else if (auto *f = dyn_cast<LargeImportFile>(file)) {
+      ctx.largeImportFileInstances.push_back(f);
+    }
+    // </COFF_LARGE_EXPORTS>
   }
 
   MachineTypes mt = file->getMachineType();
@@ -842,6 +847,70 @@ Defined *SymbolTable::addImportThunk(StringRef name, DefinedImportData *id,
   reportDuplicate(s, id->file);
   return nullptr;
 }
+
+// <COFF_LARGE_EXPORTS>
+DefinedLargeImportData *SymbolTable::addLargeImportData(StringRef importedName, LargeImportFile *f) {
+  auto [s, wasInserted] = insert(importedName, nullptr);
+  s->isUsedInRegularObj = true;
+  if (wasInserted || isa<Undefined>(s) || s->isLazy()) {
+    replaceSymbol<DefinedLargeImportData>(s, importedName, f);
+    return cast<DefinedLargeImportData>(s);
+  }
+  reportDuplicate(s, f);
+  return nullptr;
+}
+
+DefinedLargeImportSynthetic *SymbolTable::addSyntheticLargeImport(StringRef name, StringRef externalName) {
+  auto [s, wasInserted] = insert(name, nullptr);
+  s->isUsedInRegularObj = true;
+  // Synthetic imports can only replace an undefined symbol
+  if (wasInserted || isa<Undefined>(s)) {
+    replaceSymbol<DefinedLargeImportSynthetic>(s, name, externalName);
+    syntheticLargeImportSymbols.push_back(s);
+    return cast<DefinedLargeImportSynthetic>(s);
+  }
+  reportDuplicate(s, nullptr);
+  return nullptr;
+}
+
+Defined *SymbolTable::addLargeImportThunk(StringRef externalName, DefinedLargeImportData *id, ImportThunkChunk *chunk) {
+  auto [s, wasInserted] = insert(externalName, nullptr);
+  s->isUsedInRegularObj = true;
+  if (wasInserted || isa<Undefined>(s) || s->isLazy()) {
+    replaceSymbol<DefinedLargeImportThunk>(s, ctx, externalName, id, chunk);
+    return cast<Defined>(s);
+  }
+  reportDuplicate(s, id->getFile());
+  return nullptr;
+}
+
+void SymbolTable::resolveUndefinedWildcardImportSymbols() {
+  for (auto &i : symMap) {
+    Symbol *sym = i.second;
+    auto *undef = dyn_cast<Undefined>(sym);
+    if (!undef)
+      continue;
+    if (undef->getWeakAlias())
+      continue;
+
+    // We are only interested in undefined import symbols
+    StringRef name = undef->getName();
+    if (!name.starts_with("__imp_"))
+      continue;
+    StringRef externalName = name.substr(strlen("__imp_"));
+
+    // Make sure that the symbol with the external name is not defined already. Otherwise, this __imp symbol will be aliased to it automatically later
+    Symbol *alreadyDefinedExternalSymbol = find(externalName.str());
+    if (alreadyDefinedExternalSymbol && !isa<Undefined>(alreadyDefinedExternalSymbol))
+      continue;
+
+    // Replace the symbol with the synthetic import
+    log("Automatically resolving undefined import symbol " + name + " to external symbol " + externalName + " using Large Loader");
+    addSyntheticLargeImport(name, externalName);
+  }
+}
+
+// </COFF_LARGE_EXPORTS>
 
 void SymbolTable::addLibcall(StringRef name) {
   Symbol *sym = findUnderscore(name);

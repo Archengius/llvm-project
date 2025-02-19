@@ -15,6 +15,9 @@
 #include "llvm/Object/COFF.h"
 #include "llvm/Object/COFFImportFile.h"
 #include "llvm/Support/ScopedPrinter.h"
+// <COFF_LARGE_EXPORTS>
+#include "llvm/Object/COFFLargeImportFile.h"
+// </COFF_LARGE_EXPORTS>
 
 using namespace llvm::object;
 
@@ -60,5 +63,41 @@ void dumpCOFFImportFile(const COFFImportFile *File, ScopedPrinter &Writer) {
     OS << "\n";
   }
 }
+
+// <COFF_LARGE_EXPORTS>
+void dumpCOFFLargeImportFile(const COFFLargeImportFile *File, ScopedPrinter &Writer) {
+  Writer.startLine() << '\n';
+  Writer.printString("File", File->getFileName());
+  Writer.printString("Format", File->getFileFormatName());
+
+  const COFFLargeImportHeader *H = File->getCOFFLargeImportHeader();
+  switch (H->Type) {
+  case LARGE_LOADER_IMPORT_TYPE_INVALID:  Writer.printString("Type", "invalid"); break;
+  case LARGE_LOADER_IMPORT_TYPE_CODE:  Writer.printString("Type", "code"); break;
+  case LARGE_LOADER_IMPORT_TYPE_DATA:  Writer.printString("Type", "data"); break;
+  case LARGE_LOADER_IMPORT_TYPE_WILDCARD:  Writer.printString("Type", "wildcard"); break;
+  default: Writer.printString("Type", "unknown"); break;
+  }
+  // Print flags set on the import
+  {
+    SmallVector<StringRef, 8> SymbolFlags;
+    if ((H->Flags & LARGE_LOADER_IMPORT_FLAGS_WILDCARD_LOOKUP_WIN32_EXPORT_DIRECTORY) != 0)
+      SymbolFlags.push_back("lookup-win32-exports");
+    if ((H->Flags & LARGE_LOADER_IMPORT_FLAGS_SYNTHETIC) != 0)
+      SymbolFlags.push_back("synthetic");
+    Writer.printString("Flags", join(SymbolFlags, " "));
+  }
+  const StringRef DllName = File->getDllName();
+  Writer.printString("Dll name", DllName.empty() ? "<wildcard>" : DllName);
+  Writer.printString("Export name", File->getExportName());
+
+  for (const object::BasicSymbolRef &Sym : File->symbols()) {
+    raw_ostream &OS = Writer.startLine();
+    OS << "Symbol: ";
+    cantFail(Sym.printName(OS));
+    OS << "\n";
+  }
+}
+// </COFF_LARGE_EXPORTS>
 
 } // namespace llvm

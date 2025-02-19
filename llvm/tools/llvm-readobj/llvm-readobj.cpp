@@ -46,6 +46,9 @@
 #include "llvm/Support/Path.h"
 #include "llvm/Support/ScopedPrinter.h"
 #include "llvm/Support/WithColor.h"
+// <COFF_LARGE_EXPORTS>
+#include "llvm/Object/COFFLargeImportFile.h"
+// </COFF_LARGE_EXPORTS>
 
 using namespace llvm;
 using namespace llvm::object;
@@ -556,6 +559,10 @@ static void dumpArchive(const Archive *Arc, ScopedPrinter &Writer) {
       dumpObject(*Obj, Writer, Arc);
     else if (COFFImportFile *Imp = dyn_cast<COFFImportFile>(Bin))
       dumpCOFFImportFile(Imp, Writer);
+    // <COFF_LARGE_EXPORTS>
+    else if (COFFLargeImportFile *Imp = dyn_cast<COFFLargeImportFile>(Bin))
+      dumpCOFFLargeImportFile(Imp, Writer);
+    // </COFF_LARGE_EXPORTS>
     else
       reportWarning(createStringError(errc::invalid_argument,
                                       Bin->getFileName() +

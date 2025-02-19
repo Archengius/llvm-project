@@ -292,6 +292,17 @@ def print_symbol_order: P<
     "Print a symbol order specified by /call-graph-ordering-file and "
     "/call-graph-profile-sort into the specified file">;
 def wrap : P_priv<"wrap">;
+// <COFF_LARGE_EXPORTS>
+def COFF_LARGE_EXPORTS :
+    F<"large-exports">,
+    HelpText<"Enable Large Exports. Large Exports allow exporting more than 65k symbols from PE files to support building plugins for large applications">;
+def COFF_WILDCARD_IMPORT_LIB :
+    F<"wildcard-import-lib">,
+    HelpText<"Large Exports: Create an import library that does not have an explicit DLL name. Linking against such an library will result in wildcard large imports, that can be resolved against any Large Exports DLL loaded in the process in runtime">;
+def COFF_AUTO_WILDCARD_IMPORT :
+    F<"auto-wildcard-import">,
+    HelpText<"Large Exports: Automatically convert undefined imported symbols into wildcard large imports that can be resolved against any Win32 Export or Large Export loaded in the process in runtime">;
+// </COFF_LARGE_EXPORTS>
 
 def vfsoverlay : P<"vfsoverlay", "Path to a vfsoverlay yaml file to optionally look for /defaultlib's in">;
 

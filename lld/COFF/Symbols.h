@@ -49,6 +49,11 @@ public:
     DefinedLocalImportKind,
     DefinedImportThunkKind,
     DefinedImportDataKind,
+    // <COFF_LARGE_EXPORTS>
+    DefinedLargeImportDataKind,
+    DefinedLargeImportSyntheticKind,
+    DefinedLargeImportThunkKind,
+    // </COFF_LARGE_EXPORTS>
     DefinedAbsoluteKind,
     DefinedSyntheticKind,
 
@@ -425,6 +430,82 @@ private:
   LocalImportChunk *data;
 };
 
+// <COFF_LARGE_EXPORTS>
+
+// Base class for defined large imports. Underlying type can be either synthetic import or a large import loaded from an import library
+class DefinedLargeImport : public Defined {
+public:
+  DefinedLargeImport(Kind k, StringRef n) : Defined(k, n) {}
+
+  static bool classof(const Symbol *s);
+  uint64_t getRVA() const { return getChunk()->getRVA(); }
+
+  Chunk *getChunk() const;
+  void setLocation(Chunk *addressTable);
+  StringRef getDLLName() const;
+  StringRef getExternalName() const;
+  uint8_t getImportType() const;
+  uint8_t getImportFlags() const;
+};
+
+class DefinedLargeImportThunk : public Defined {
+public:
+  DefinedLargeImportThunk(COFFLinkerContext &ctx, StringRef name,
+                     DefinedLargeImport *s, ImportThunkChunk *chunk) :
+    Defined(DefinedLargeImportThunkKind, name), wrappedSym(s), data(chunk) {}
+
+  static bool classof(const Symbol *s) {
+    return s->kind() == DefinedLargeImportThunkKind;
+  }
+
+  uint64_t getRVA() { return data->getRVA(); }
+  ImportThunkChunk *getChunk() const { return data; }
+
+  DefinedLargeImport *wrappedSym;
+private:
+  ImportThunkChunk *data;
+};
+
+class DefinedLargeImportData : public DefinedLargeImport {
+public:
+  DefinedLargeImportData(StringRef n, LargeImportFile *file) : DefinedLargeImport(DefinedLargeImportDataKind, n), file(file) {}
+
+  static bool classof(const Symbol *s) {
+    return s->kind() == DefinedLargeImportDataKind;
+  }
+
+  Chunk *getChunk() const { return file->location; }
+  void setLocation(Chunk *addressTable) { file->location = addressTable; }
+
+  StringRef getDLLName() const { return file->dllName; }
+  StringRef getExternalName() const { return file->externalName; }
+  uint8_t getImportType() const { return file->importType; }
+  uint8_t getImportFlags() const { return file->importFlags; }
+
+  LargeImportFile *file;
+};
+
+class DefinedLargeImportSynthetic : public DefinedLargeImport {
+public:
+  DefinedLargeImportSynthetic(StringRef name, StringRef externalName) : DefinedLargeImport(DefinedLargeImportSyntheticKind, name), externalName(externalName) {}
+
+  static bool classof(const Symbol *s) {
+    return s->kind() == DefinedLargeImportSyntheticKind;
+  }
+
+  Chunk *getChunk() const { return location; }
+  void setLocation(Chunk *addressTable) { location = addressTable; }
+
+  StringRef getDLLName() const;
+  StringRef getExternalName() const { return externalName; }
+  uint8_t getImportType() const;
+  uint8_t getImportFlags() const;
+
+  Chunk *location{nullptr};
+  StringRef externalName;
+};
+// </COFF_LARGE_EXPORTS>
+
 inline uint64_t Defined::getRVA() {
   switch (kind()) {
   case DefinedAbsoluteKind:
@@ -437,6 +518,13 @@ inline uint64_t Defined::getRVA() {
     return cast<DefinedImportThunk>(this)->getRVA();
   case DefinedLocalImportKind:
     return cast<DefinedLocalImport>(this)->getRVA();
+  // <COFF_LARGE_EXPORTS>
+  case DefinedLargeImportDataKind:
+  case DefinedLargeImportSyntheticKind:
+    return cast<DefinedLargeImport>(this)->getRVA();
+  case DefinedLargeImportThunkKind:
+    return cast<DefinedLargeImportThunk>(this)->getRVA();
+  // </COFF_LARGE_EXPORTS>
   case DefinedCommonKind:
     return cast<DefinedCommon>(this)->getRVA();
   case DefinedRegularKind:
@@ -464,6 +552,13 @@ inline Chunk *Defined::getChunk() {
     return cast<DefinedImportThunk>(this)->getChunk();
   case DefinedLocalImportKind:
     return cast<DefinedLocalImport>(this)->getChunk();
+  // <COFF_LARGE_EXPORTS>
+  case DefinedLargeImportDataKind:
+  case DefinedLargeImportSyntheticKind:
+    return cast<DefinedLargeImport>(this)->getChunk();
+  case DefinedLargeImportThunkKind:
+    return cast<DefinedLargeImportThunk>(this)->getChunk();
+  // </COFF_LARGE_EXPORTS>
   case DefinedCommonKind:
     return cast<DefinedCommon>(this)->getChunk();
   case LazyArchiveKind:
@@ -490,6 +585,11 @@ union SymbolUnion {
   alignas(DefinedLocalImport) char i[sizeof(DefinedLocalImport)];
   alignas(LazyObject) char j[sizeof(LazyObject)];
   alignas(LazyDLLSymbol) char k[sizeof(LazyDLLSymbol)];
+  // <COFF_LARGE_EXPORTS>
+  alignas(DefinedLargeImportData) char l[sizeof(DefinedLargeImportData)];
+  alignas(DefinedLargeImportSynthetic) char m[sizeof(DefinedLargeImportSynthetic)];
+  alignas(DefinedLargeImportThunk) char n[sizeof(DefinedLargeImportThunk)];
+  // </COFF_LARGE_EXPORTS>
 };
 
 template <typename T, typename... ArgT>

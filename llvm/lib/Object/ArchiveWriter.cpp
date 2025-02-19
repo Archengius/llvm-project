@@ -34,6 +34,9 @@
 #include "llvm/Support/Path.h"
 #include "llvm/Support/SmallVectorMemoryBuffer.h"
 #include "llvm/Support/raw_ostream.h"
+// <COFF_LARGE_EXPORTS>
+#include "llvm/Object/COFFLargeImportFile.h"
+// </COFF_LARGE_EXPORTS>
 
 #include <cerrno>
 #include <map>
@@ -68,7 +71,10 @@ object::Archive::Kind NewArchiveMember::detectKindFromObject() const {
     if (isa<object::XCOFFObjectFile>(**OptionalObject))
       return object::Archive::K_AIXBIG;
     if (isa<object::COFFObjectFile>(**OptionalObject) ||
-        isa<object::COFFImportFile>(**OptionalObject))
+    // <COFF_LARGE_EXPORTS>
+        isa<object::COFFImportFile>(**OptionalObject) ||
+        isa<object::COFFLargeImportFile>(**OptionalObject))
+    // </COFF_LARGE_EXPORTS>
       return object::Archive::K_COFF;
     return object::Archive::K_GNU;
   }
@@ -694,6 +700,11 @@ static bool isECObject(object::SymbolicFile &Obj) {
   if (Obj.isCOFFImportFile())
     return cast<llvm::object::COFFImportFile>(&Obj)->getMachine() !=
            COFF::IMAGE_FILE_MACHINE_ARM64;
+  // <COFF_LARGE_EXPORTS>
+  if (Obj.IsLargeCOFFImportFile())
+    return cast<llvm::object::COFFLargeImportFile>(&Obj)->getMachine() !=
+          COFF::IMAGE_FILE_MACHINE_ARM64;
+  // </COFF_LARGE_EXPORTS>
 
   if (Obj.isIR()) {
     Expected<std::string> TripleStr =
@@ -713,6 +724,10 @@ static bool isAnyArm64COFF(object::SymbolicFile &Obj) {
 
   if (Obj.isCOFFImportFile())
     return COFF::isAnyArm64(cast<COFFImportFile>(&Obj)->getMachine());
+  // <COFF_LARGE_EXPORTS>
+  if (Obj.IsLargeCOFFImportFile())
+    return COFF::isAnyArm64(cast<COFFLargeImportFile>(&Obj)->getMachine());
+  // </COFF_LARGE_EXPORTS>
 
   if (Obj.isIR()) {
     Expected<std::string> TripleStr =

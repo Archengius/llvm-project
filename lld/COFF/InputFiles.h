@@ -61,6 +61,11 @@ class SectionChunk;
 class Symbol;
 class Undefined;
 class TpiSource;
+// <COFF_LARGE_EXPORTS>
+class DefinedLargeImport;
+class DefinedLargeImportData;
+class DefinedLargeImportThunk;
+// </COFF_LARGE_EXPORTS>
 
 // The root class of input files.
 class InputFile {
@@ -72,7 +77,10 @@ public:
     PDBKind,
     ImportKind,
     BitcodeKind,
-    DLLKind
+    // <COFF_LARGE_EXPORTS> Added LargeImportKind
+    DLLKind,
+    LargeImportKind
+    // </COFF_LARGE_EXPORTS>
   };
   Kind kind() const { return fileKind; }
   virtual ~InputFile() {}
@@ -377,6 +385,45 @@ public:
   // symbols provided by this import library member.
   bool live;
 };
+
+// <COFF_LARGE_EXPORTS>
+// This type represents Large Import definition that maps to a specific symbol name
+// without an ordinal, and with an optional file association
+// DLL association is only used to speed up the symbol lookups, but is used as a hint rather than a rule,
+// compared to traditional PE import/export tables.
+class LargeImportFile : public InputFile {
+public:
+  explicit LargeImportFile(COFFLinkerContext &ctx, MemoryBufferRef m);
+
+  static bool classof(const InputFile *f) { return f->kind() == LargeImportKind; }
+  MachineTypes getMachineType() const override;
+private:
+  void parse() override;
+  ImportThunkChunk *makeImportThunk();
+
+public:
+  // Name of the symbol, without the __imp_ prefix appended for the import symbols
+  StringRef externalName;
+  // Type of this import
+  uint8_t importType;
+  // Flags set on this import
+  uint8_t importFlags;
+  // Name of the DLL/PE file that this symbol comes from. Empty means a wildcard import, e.g. look up this import in all loaded DLLs
+  StringRef dllName;
+  // If this import is considered live, and is included into the large import section, this will be a chunk that contains the value of this data symbol
+  Chunk *location = nullptr;
+
+  // Import symbol for data members and function pointers
+  DefinedLargeImportData *impSym = nullptr;
+  // Import symbol for function thunks for code that is unaware of the fact that the member is imported and not defined locally
+  Defined *thunkSym = nullptr;
+
+  // True if this file has been referenced by any symbols. This is set by MarkWrite
+  // to eliminate large imports that are not actually referenced, which is important since large imports
+  // usually imply an extremely large number of exports that would take a lot of time to dynamically link
+  bool live;
+};
+// </COFF_LARGE_EXPORTS>
 
 // Used for LTO.
 class BitcodeFile : public InputFile {

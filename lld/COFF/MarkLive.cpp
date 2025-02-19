@@ -60,6 +60,19 @@ void markLive(COFFLinkerContext &ctx) {
       addImportFile(sym->wrappedSym->file);
       sym->getChunk()->live = true;
     }
+    // <COFF_LARGE_EXPORTS>
+    else if (auto *sym = dyn_cast<DefinedLargeImportData>(b)) {
+      // File might be null if the symbol was added as a fallback unresolved symbol
+      if (sym->file)
+        sym->file->live = true;
+    }
+    else if (auto *sym = dyn_cast<DefinedLargeImportThunk>(b)) {
+      // File might be null if the symbol was added as a fallback unresolved symbol
+      if (sym->wrappedSym->getFile())
+        cast<LargeImportFile>(sym->wrappedSym->getFile())->live = true;
+      sym->getChunk()->live = true;
+    }
+    // </COFF_LARGE_EXPORTS>
   };
 
   // Add GC root chunks.

@@ -36,6 +36,9 @@ public:
   std::map<std::string, PDBInputFile *> pdbInputFileInstances;
   std::vector<ImportFile *> importFileInstances;
   std::vector<BitcodeFile *> bitcodeFileInstances;
+  // <COFF_LARGE_EXPORTS>
+  std::vector<LargeImportFile *> largeImportFileInstances;
+  // </COFF_LARGE_EXPORTS>
 
   MergeChunk *mergeChunkInstances[Log2MaxSectionAlignment + 1] = {};
 

@@ -19,6 +19,9 @@ namespace object {
 class COFFObjectFile;
 class COFFImportFile;
 class RelocationRef;
+// <COFF_LARGE_EXPORTS>
+class COFFLargeImportFile;
+// </COFF_LARGE_EXPORTS>
 } // namespace object
 
 namespace objdump {
@@ -30,6 +33,9 @@ void printCOFFUnwindInfo(const object::COFFObjectFile *O);
 void printCOFFFileHeader(const object::COFFObjectFile &Obj);
 void printCOFFSymbolTable(const object::COFFImportFile &I);
 void printCOFFSymbolTable(const object::COFFObjectFile &O);
+// <COFF_LARGE_EXPORTS>
+void printCOFFSymbolTable(const object::COFFLargeImportFile &I);
+// </COFF_LARGE_EXPORTS>
 } // namespace objdump
 } // namespace llvm
 

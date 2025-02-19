@@ -104,6 +104,10 @@ file_magic llvm::identify_magic(StringRef Magic) {
   case '!':
     if (startswith(Magic, "!<arch>\n") || startswith(Magic, "!<thin>\n"))
       return file_magic::archive;
+    // <COFF_LARGE_EXPORTS>
+    if (startswith(Magic, "!<limp>\n"))
+      return file_magic::coff_large_import_library;
+    // </COFF_LARGE_EXPORTS>
     break;
   case '<':
     if (startswith(Magic, "<bigaf>\n"))

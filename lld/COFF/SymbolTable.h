@@ -32,6 +32,10 @@ class ImportThunkChunk;
 class LazyArchive;
 class SectionChunk;
 class Symbol;
+// <COFF_LARGE_EXPORTS>
+class DefinedLargeImportData;
+class DefinedLargeImportSynthetic;
+// </COFF_LARGE_EXPORTS>
 
 // SymbolTable is a bucket of all known symbols, including defined,
 // undefined, or lazy symbols (the last one is symbols in archive
@@ -110,6 +114,12 @@ public:
                                    Chunk *&location);
   Defined *addImportThunk(StringRef name, DefinedImportData *s,
                           ImportThunkChunk *chunk);
+  // <COFF_LARGE_EXPORTS>
+  DefinedLargeImportData *addLargeImportData(StringRef importedName, LargeImportFile *f);
+  DefinedLargeImportSynthetic *addSyntheticLargeImport(StringRef name, StringRef externalName);
+  Defined *addLargeImportThunk(StringRef externalName, DefinedLargeImportData *id, ImportThunkChunk *chunk);
+  void resolveUndefinedWildcardImportSymbols();
+  // </COFF_LARGE_EXPORTS>
   void addLibcall(StringRef name);
   void addEntryThunk(Symbol *from, Symbol *to);
   void addExitThunk(Symbol *from, Symbol *to);
@@ -124,6 +134,10 @@ public:
 
   // A list of EC EXP+ symbols.
   std::vector<Symbol *> expSymbols;
+  // <COFF_LARGE_EXPORTS>
+  // A list of synthetic large import symbols. They do not have associated import files, so they are standalone
+  std::vector<Symbol *> syntheticLargeImportSymbols;
+  // </COFF_LARGE_EXPORTS>
 
   // Iterates symbols in non-determinstic hash table order.
   template <typename T> void forEachSymbol(T callback) {

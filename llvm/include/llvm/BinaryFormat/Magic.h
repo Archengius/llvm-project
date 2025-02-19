@@ -59,6 +59,9 @@ struct file_magic {
     offload_bundle,            ///< Clang offload bundle file
     offload_bundle_compressed, ///< Compressed clang offload bundle file
     spirv_object,              ///< A binary SPIR-V file
+    // <COFF_LARGE_EXPORTS>
+    coff_large_import_library, /// COFF Large Import library
+    // </COFF_LARGE_EXPORTS>
   };
 
   bool is_object() const { return V != unknown; }

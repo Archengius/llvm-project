@@ -37,6 +37,9 @@
 #include "llvm/Support/Path.h"
 #include "llvm/Target/TargetOptions.h"
 #include "llvm/TargetParser/Triple.h"
+// <COFF_LARGE_EXPORTS>
+#include "llvm/Object/COFFLargeImport.h"
+// </COFF_LARGE_EXPORTS>
 #include <cstring>
 #include <optional>
 #include <system_error>
@@ -1132,6 +1135,67 @@ void ImportFile::parse() {
     }
   }
 }
+
+// <COFF_LARGE_EXPORTS>
+LargeImportFile::LargeImportFile(COFFLinkerContext &ctx, MemoryBufferRef m) : InputFile(ctx, LargeImportKind, m), live(!ctx.config.doGC) {
+}
+
+MachineTypes LargeImportFile::getMachineType() const {
+  uint16_t Machine = reinterpret_cast<const COFFLargeImportHeader *>(mb.getBufferStart())->Machine;
+  return MachineTypes(Machine);
+}
+
+void LargeImportFile::parse() {
+  // Make sure we have enough data to read the header
+  if (mb.getBufferSize() < sizeof(COFFLargeImportHeader))
+    fatal("Received corrupted large import file with size smaller than the large import header");
+
+  const auto *header = reinterpret_cast<const COFFLargeImportHeader *>(mb.getBufferStart());
+
+  // Make sure the version of the header file is supported
+  if (header->Version != 1)
+    fatal("Received large import file with unknown version number " + std::to_string(header->Version) + ". Latest version supported by this linker is 1.");
+
+  // Make sure the data is not corrupted. We should have at least enough data to cover DLL name, header and export name. Additional metadata after the import is permitted.
+  if (mb.getBufferSize() < (sizeof(COFFLargeImportHeader) + header->SizeOfSymbolName + header->SizeOfDllNameHint))
+    fatal("Received corrupted large import file with size smaller than the calculated import payload size");
+
+  importType = header->Type;
+  importFlags = header->Flags;
+  externalName = mb.getBuffer().substr(sizeof(COFFLargeImportHeader), header->SizeOfSymbolName);
+  dllName = mb.getBuffer().substr(sizeof(COFFLargeImportHeader) + header->SizeOfSymbolName, header->SizeOfDllNameHint);
+
+  // Make sure machine type matches the machine type we are linking for
+  uint16_t libMachineType = header->Machine;
+  if (header->Machine != ctx.config.machine)
+    fatal("Attempting to link against a large import file " + externalName + " built for machine type " + machineToStr((MachineTypes)libMachineType) + " while linking a target for machine type " + machineToStr(ctx.config.machine));
+
+  StringRef importName = saver().save("__imp_" + externalName);
+  impSym = ctx.symtab.addLargeImportData(importName, this);
+
+  // Create the thunk that can be called directly by the code that is unaware of the fact that this is an import, if this import represents a function
+  // Note that because the external code is unaware that it is an import, the name of the function is not prefixed with the __imp_ prefix, and directly represents the external name
+  if (header->Type == LARGE_LOADER_IMPORT_TYPE_CODE) {
+    thunkSym = ctx.symtab.addLargeImportThunk(externalName, impSym, makeImportThunk());
+  }
+}
+
+ImportThunkChunk *LargeImportFile::makeImportThunk() {
+  const auto *header = reinterpret_cast<const COFFLargeImportHeader *>(mb.getBufferStart());
+
+  switch (header->Machine) {
+  case AMD64:
+    return make<ImportThunkChunkX64>(ctx, impSym);
+  case I386:
+    return make<ImportThunkChunkX86>(ctx, impSym);
+  case ARM64:
+    return make<ImportThunkChunkARM64>(ctx, impSym, ARM64);
+  case ARMNT:
+    return make<ImportThunkChunkARM>(ctx, impSym);
+  }
+  llvm_unreachable("unknown machine type");
+}
+// </COFF_LARGE_EXPORTS>
 
 BitcodeFile::BitcodeFile(COFFLinkerContext &ctx, MemoryBufferRef mb,
                          StringRef archiveName, uint64_t offsetInArchive,
