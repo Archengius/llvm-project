@@ -135,6 +135,23 @@ static void getSymbols(const COFFLinkerContext &ctx,
     if (file->auxImpCopySym)
       syms.push_back(file->auxImpCopySym);
   }
+  // <COFF_LARGE_EXPORTS>
+  // Append all symbols from Large Import files into the symbol map file as well.
+  for (LargeImportData *file : ctx.largeImportFileInstances) {
+    if (!file->isLive())
+      continue;
+    if (file->impSym)
+      syms.push_back(file->impSym);
+    if (file->thunkSym && file->thunkSym->isLive())
+      syms.push_back(file->thunkSym);
+    if (file->auxThunkSym && file->auxThunkSym->isLive())
+      syms.push_back(file->auxThunkSym);
+    if (file->impchkThunk)
+      syms.push_back(file->impchkThunk->sym);
+    if (file->impECSym)
+      syms.push_back(file->impECSym);
+  }
+  // </COFF_LARGE_EXPORTS>
 
   sortUniqueSymbols(syms, ctx.config.imageBase);
   sortUniqueSymbols(staticSyms, ctx.config.imageBase);

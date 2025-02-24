@@ -631,6 +631,17 @@ void SymbolTable::initializeECThunks() {
       sym = exitThunks.lookup(file->impECSym);
     file->impchkThunk->exitThunk = dyn_cast_or_null<Defined>(sym);
   }
+  // <COFF_LARGE_EXPORTS>
+  // Also populate call check thunks on large imports with exit thunk symbols gathered from object files
+  for (LargeImportData *file : ctx.largeImportFileInstances) {
+    if (!file->impchkThunk)
+      continue;
+    Symbol *sym = exitThunks.lookup(file->thunkSym);
+    if (!sym)
+      sym = exitThunks.lookup(file->impECSym);
+    file->impchkThunk->exitThunk = dyn_cast_or_null<Defined>(sym);
+  }
+  // </COFF_LARGE_EXPORTS>
 
   // On ARM64EC, the __imp_ symbol references the auxiliary IAT, while the
   // __imp_aux_ symbol references the regular IAT. However, x86_64 code expects
@@ -642,6 +653,12 @@ void SymbolTable::initializeECThunks() {
       auto impSym = dyn_cast_or_null<DefinedImportData>(sym);
       if (impSym && impSym->file->impchkThunk && sym == impSym->file->impECSym)
         sym = impSym->file->impSym;
+      // <COFF_LARGE_EXPORTS>
+      // Same logic applies to Large Import Data on ARM64EC. X64 object files attempting to import code should point to auxiliary IAT, not to the regular IAT
+      auto largeImpSym = dyn_cast_or_null<DefinedLargeImport>(sym);
+      if (largeImpSym && largeImpSym->file->impchkThunk && sym == largeImpSym->file->impECSym)
+        sym = impSym->file->impSym;
+      // </COFF_LARGE_EXPORTS>
     }
   });
 }
@@ -935,32 +952,18 @@ Defined *SymbolTable::addImportThunk(StringRef name, DefinedImportData *id,
   return nullptr;
 }
 
-// <COFF_LARGE_EXPORTS>
-DefinedLargeImportData *SymbolTable::addLargeImportData(StringRef importedName, LargeImportFile *f) {
+DefinedLargeImport *SymbolTable::addLargeImport(StringRef importedName, LargeImportData *f, Chunk* &location, bool isARM64ECAuxiliaryIATCodeChunk) {
   auto [s, wasInserted] = insert(importedName, nullptr);
   s->isUsedInRegularObj = true;
   if (wasInserted || isa<Undefined>(s) || s->isLazy()) {
-    replaceSymbol<DefinedLargeImportData>(s, importedName, f);
-    return cast<DefinedLargeImportData>(s);
+    replaceSymbol<DefinedLargeImport>(s, importedName, f, location, isARM64ECAuxiliaryIATCodeChunk);
+    return cast<DefinedLargeImport>(s);
   }
-  reportDuplicate(s, f);
+  reportDuplicate(s, f->getFile());
   return nullptr;
 }
 
-DefinedLargeImportSynthetic *SymbolTable::addSyntheticLargeImport(StringRef name, StringRef externalName) {
-  auto [s, wasInserted] = insert(name, nullptr);
-  s->isUsedInRegularObj = true;
-  // Synthetic imports can only replace an undefined symbol
-  if (wasInserted || isa<Undefined>(s)) {
-    replaceSymbol<DefinedLargeImportSynthetic>(s, name, externalName);
-    syntheticLargeImportSymbols.push_back(s);
-    return cast<DefinedLargeImportSynthetic>(s);
-  }
-  reportDuplicate(s, nullptr);
-  return nullptr;
-}
-
-Defined *SymbolTable::addLargeImportThunk(StringRef externalName, DefinedLargeImportData *id, ImportThunkChunk *chunk) {
+Defined *SymbolTable::addLargeImportThunk(StringRef externalName, DefinedLargeImport *id, ImportThunkChunk *chunk) {
   auto [s, wasInserted] = insert(externalName, nullptr);
   s->isUsedInRegularObj = true;
   if (wasInserted || isa<Undefined>(s) || s->isLazy()) {
@@ -972,6 +975,8 @@ Defined *SymbolTable::addLargeImportThunk(StringRef externalName, DefinedLargeIm
 }
 
 void SymbolTable::resolveUndefinedWildcardImportSymbols() {
+  // Collect all external imported symbols that are not defined into the hash set
+  std::set<StringRef> unresolvedExternalImportedSymbols;
   for (auto &i : symMap) {
     Symbol *sym = i.second;
     auto *undef = dyn_cast<Undefined>(sym);
@@ -979,21 +984,26 @@ void SymbolTable::resolveUndefinedWildcardImportSymbols() {
       continue;
     if (undef->getWeakAlias())
       continue;
+    StringRef name = undef->getName();
 
     // We are only interested in undefined import symbols
-    StringRef name = undef->getName();
-    if (!name.starts_with("__imp_"))
-      continue;
-    StringRef externalName = name.substr(strlen("__imp_"));
+    if (name.starts_with("__imp_")) {
+      StringRef externalName = name.substr(strlen("__imp_"));
+      unresolvedExternalImportedSymbols.insert(externalName);
+    }
+    // Handle undefined auxiliary import symbols on ARM64EC as well
+    if (isArm64EC(machine) && name.starts_with("__imp_aux_")) {
+      StringRef externalName = name.substr(strlen("__imp_aux_"));
+      unresolvedExternalImportedSymbols.insert(externalName);
+    }
+  }
 
-    // Make sure that the symbol with the external name is not defined already. Otherwise, this __imp symbol will be aliased to it automatically later
-    Symbol *alreadyDefinedExternalSymbol = find(externalName.str());
-    if (alreadyDefinedExternalSymbol && !isa<Undefined>(alreadyDefinedExternalSymbol))
-      continue;
+  // Define synthetic import files for all of them
+  for (const StringRef &externalName : unresolvedExternalImportedSymbols) {
+    Log(ctx) << "Automatically resolving undefined imported external symbol " << externalName << " using Large Loader";
 
-    // Replace the symbol with the synthetic import
-    log("Automatically resolving undefined import symbol " + name + " to external symbol " + externalName + " using Large Loader");
-    addSyntheticLargeImport(name, externalName);
+    SyntheticLargeImportData *syntheticImportData = make<SyntheticLargeImportData>(*this, externalName);
+    ctx.largeImportFileInstances.push_back(syntheticImportData);
   }
 }
 
@@ -1322,6 +1332,38 @@ void SymbolTable::assignExportOrdinals() {
     Fatal(ctx) << "too many exported symbols (got " << max << ", max "
                << Twine(std::numeric_limits<uint16_t>::max()) << ")";
 }
+
+// <COFF_LARGE_EXPORTS>
+void SymbolTable::validateLargeExports() {
+  bool exportValidationFailed = false;
+
+  for (Export &e : exports) {
+    // Unnamed/ordinal-only exports are not supported in large exports mode
+    if (e.noname) {
+      exportValidationFailed = false;
+      Err(ctx) << "Found unnamed DLL Export " << e.name << " with ordinal " << std::to_string(e.ordinal) << ". Unnamed exports are not supported in Large Loader/Large Exports mode.";
+    }
+    // Large exports do not support forwarding
+    if (!e.forwardTo.empty()) {
+      exportValidationFailed = true;
+      Err(ctx) << "DLL Export Forwarding is not supported in Large Loader/Large Exports mode. Tried to forward " << e.name + " to " << e.forwardTo;
+    }
+    // Large exports do not support MiNGW alternate imports
+    if (!e.importName.empty()) {
+      exportValidationFailed = false;
+      Err(ctx) << "DLL GNU/MinGW like alternate imports are not supported in Large Loader/Large Exports mode. Tried to alias export " << e.name << " to " << e.importName;
+    }
+    // Large exports do not use ordinals, so warn when the explicit ordinals are specified for large exports
+    if (e.ordinal != 0)
+      Warn(ctx) << "Explicit ordinal was specified for an export " << e.name << ". Large Loader does not use ordinals, so the explicit ordinal value will be ignored.";
+  }
+
+  // Abort immediately if we found any unsupported exports
+  if (exportValidationFailed) {
+    Fatal(ctx) << "Failed to validate exports for output file";
+  }
+}
+// </COFF_LARGE_EXPORTS>
 
 void SymbolTable::parseModuleDefs(StringRef path) {
   llvm::TimeTraceScope timeScope("Parse def file");

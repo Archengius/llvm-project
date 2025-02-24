@@ -249,9 +249,6 @@ private:
 
   // Used for dllexported symbols.
   Export parseExport(StringRef arg);
-  // <COFF_LARGE_EXPORTS>
-  void validateLargeExports();
-  // </COFF_LARGE_EXPORTS>
 
   // Parses a string in the form of "key=value" and check
   // if value matches previous values for the key.

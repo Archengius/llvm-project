@@ -1120,7 +1120,10 @@ void CHPERedirectionChunk::writeTo(uint8_t *buf) const {
 }
 
 ImportThunkChunkARM64EC::ImportThunkChunkARM64EC(ImportFile *file)
-    : ImportThunkChunk(file->symtab.ctx, file->impSym), file(file) {}
+// <COFF_LARGE_EXPORTS>
+    : ImportThunkChunk(file->symtab.ctx, file->impSym), symtab(file->symtab) {}
+ImportThunkChunkARM64EC::ImportThunkChunkARM64EC(SymbolTable &symtab, Defined *impSym) : ImportThunkChunk(symtab.ctx, impSym), symtab(symtab) {}
+// </COFF_LARGE_EXPORTS>
 
 size_t ImportThunkChunkARM64EC::getSize() const {
   if (!extended)
@@ -1131,8 +1134,10 @@ size_t ImportThunkChunkARM64EC::getSize() const {
 
 void ImportThunkChunkARM64EC::writeTo(uint8_t *buf) const {
   memcpy(buf, importThunkARM64EC, sizeof(importThunkARM64EC));
-  applyArm64Addr(buf, file->impSym->getRVA(), rva, 12);
-  applyArm64Ldr(buf + 4, file->impSym->getRVA() & 0xfff);
+  // <COFF_LARGE_EXPORTS>
+  applyArm64Addr(buf, impSymbol->getRVA(), rva, 12);
+  applyArm64Ldr(buf + 4, impSymbol->getRVA() & 0xfff);
+  // </COFF_LARGE_EXPORTS>
 
   // The exit thunk may be missing. This can happen if the application only
   // references a function by its address (in which case the thunk is never
@@ -1144,7 +1149,8 @@ void ImportThunkChunkARM64EC::writeTo(uint8_t *buf) const {
   applyArm64Addr(buf + 8, exitThunkRVA, rva + 8, 12);
   applyArm64Imm(buf + 12, exitThunkRVA & 0xfff, 0);
 
-  Defined *helper = cast<Defined>(file->symtab.ctx.config.arm64ECIcallHelper);
+  // <COFF_LARGE_EXPORTS>
+  Defined *helper = cast<Defined>(symtab.ctx.config.arm64ECIcallHelper);
   if (extended) {
     // Replace last instruction with an inline range extension thunk.
     memcpy(buf + 16, arm64Thunk, sizeof(arm64Thunk));
@@ -1158,7 +1164,8 @@ void ImportThunkChunkARM64EC::writeTo(uint8_t *buf) const {
 bool ImportThunkChunkARM64EC::verifyRanges() {
   if (extended)
     return true;
-  auto helper = cast<Defined>(file->symtab.ctx.config.arm64ECIcallHelper);
+  // <COFF_LARGE_EXPORTS>
+  auto helper = cast<Defined>(symtab.ctx.config.arm64ECIcallHelper);
   return isInt<28>(helper->getRVA() - rva - 16);
 }
 

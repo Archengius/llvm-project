@@ -38,14 +38,22 @@ StringRef COFFLargeImportFile::getFileFormatName() const {
   }
 }
 
-StringRef COFFLargeImportFile::getExportName() const {
+StringRef COFFLargeImportFile::getSymbolName() const {
   const COFFLargeImportHeader *hdr = getCOFFLargeImportHeader();
-  return Data.getBuffer().substr(sizeof(*hdr), hdr->SizeOfSymbolName);
+  return Data.getBuffer().substr(sizeof(*hdr), hdr->SizeOfInternalSymbolName);
+}
+
+StringRef COFFLargeImportFile::getExportName() const {
+  // Explicit export name is given when external symbol name size is not zero, otherwise external name matches the symbol name
+  const COFFLargeImportHeader *hdr = getCOFFLargeImportHeader();
+  if (hdr->SizeOfExternalSymbolName)
+    return Data.getBuffer().substr(sizeof(*hdr) + hdr->SizeOfInternalSymbolName + hdr->SizeOfDllNameHint, hdr->SizeOfExternalSymbolName);
+  return getSymbolName();
 }
 
 StringRef COFFLargeImportFile::getDllName() const {
   const COFFLargeImportHeader *hdr = getCOFFLargeImportHeader();
-  return Data.getBuffer().substr(sizeof(*hdr) + hdr->SizeOfSymbolName, hdr->SizeOfDllNameHint);
+  return Data.getBuffer().substr(sizeof(*hdr) + hdr->SizeOfInternalSymbolName, hdr->SizeOfDllNameHint);
 }
 
 Error COFFLargeImportFile::printSymbolName(raw_ostream &OS, DataRefImpl Symb) const {
@@ -54,7 +62,7 @@ Error COFFLargeImportFile::printSymbolName(raw_ostream &OS, DataRefImpl Symb) co
     OS << "__imp_";
     break;
   }
-  OS << getExportName();
+  OS << getSymbolName();
   return Error::success();
 }
 

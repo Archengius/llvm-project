@@ -92,8 +92,8 @@ InputFile *Symbol::getFile() {
   // <COFF_LARGE_EXPORTS>
   if (auto *sym = dyn_cast<DefinedLargeImportThunk>(this))
     return sym->wrappedSym->getFile();
-  if (auto *sym = dyn_cast<DefinedLargeImportData>(this))
-    return sym->file;
+  if (auto *sym = dyn_cast<DefinedLargeImport>(this))
+    return sym->file->getFile();
   // </COFF_LARGE_EXPORTS>
   return nullptr;
 }
@@ -106,8 +106,8 @@ bool Symbol::isLive() const {
   if (auto *imp = dyn_cast<DefinedImportThunk>(this))
     return imp->getChunk()->live;
   // <COFF_LARGE_EXPORTS>
-  if (auto *limp = dyn_cast<DefinedLargeImportData>(this))
-    return limp->file->live;
+  if (auto *limp = dyn_cast<DefinedLargeImport>(this))
+    return limp->file->isLive();
   if (auto *limpt = dyn_cast<DefinedLargeImportThunk>(this))
     return limpt->getChunk()->live;
   // </COFF_LARGE_EXPORTS>
@@ -176,64 +176,6 @@ bool Undefined::resolveWeakAlias() {
   isAntiDep = wasAntiDep;
   return true;
 }
-
-// <COFF_LARGE_EXPORTS>
-bool DefinedLargeImport::classof(const Symbol *s) {
-  return s->kind() == DefinedLargeImportDataKind || s->kind() == DefinedLargeImportSyntheticKind;
-}
-
-Chunk *DefinedLargeImport::getChunk() const {
-  if (auto *sym = dyn_cast<DefinedLargeImportData>(this))
-    return sym->getChunk();
-  if (auto *sym = dyn_cast<DefinedLargeImportSynthetic>(this))
-    return sym->getChunk();
-  return nullptr;
-}
-void DefinedLargeImport::setLocation(Chunk *addressTable) {
-  if (auto *sym = dyn_cast<DefinedLargeImportData>(this))
-    sym->setLocation(addressTable);
-  else if (auto *sym = dyn_cast<DefinedLargeImportSynthetic>(this))
-    sym->setLocation(addressTable);
-}
-
-StringRef DefinedLargeImport::getDLLName() const {
-  if (auto *sym = dyn_cast<DefinedLargeImportData>(this))
-    return sym->getDLLName();
-  if (auto *sym = dyn_cast<DefinedLargeImportSynthetic>(this))
-    return sym->getDLLName();
-  return StringRef();
-}
-
-StringRef DefinedLargeImport::getExternalName() const {
-  if (auto *sym = dyn_cast<DefinedLargeImportData>(this))
-    return sym->getExternalName();
-  if (auto *sym = dyn_cast<DefinedLargeImportSynthetic>(this))
-    return sym->getExternalName();
-  return StringRef();
-}
-
-uint8_t DefinedLargeImport::getImportType() const {
-  if (auto *sym = dyn_cast<DefinedLargeImportData>(this))
-    return sym->getImportType();
-  if (auto *sym = dyn_cast<DefinedLargeImportSynthetic>(this))
-    return sym->getImportType();
-  return LARGE_LOADER_IMPORT_TYPE_INVALID;
-}
-
-uint8_t DefinedLargeImport::getImportFlags() const {
- if (auto *sym = dyn_cast<DefinedLargeImportData>(this))
-    return sym->getImportFlags();
-  if (auto *sym = dyn_cast<DefinedLargeImportSynthetic>(this))
-    return sym->getImportFlags();
-  return LARGE_LOADER_IMPORT_FLAGS_NONE;
-}
-
-// Synthetic Large Imports are Wildcard Large Imports with no DLL name, any import type (either data or code), that can also match against Win32 Export Directory
-StringRef DefinedLargeImportSynthetic::getDLLName() const { return StringRef(); }
-uint8_t DefinedLargeImportSynthetic::getImportType() const { return LARGE_LOADER_IMPORT_TYPE_WILDCARD; }
-uint8_t DefinedLargeImportSynthetic::getImportFlags() const { return LARGE_LOADER_IMPORT_FLAGS_WILDCARD_LOOKUP_WIN32_EXPORT_DIRECTORY | LARGE_LOADER_IMPORT_FLAGS_SYNTHETIC; }
-
-// </COFF_LARGE_EXPORTS>
 
 MemoryBufferRef LazyArchive::getMemberBuffer() {
   Archive::Child c =

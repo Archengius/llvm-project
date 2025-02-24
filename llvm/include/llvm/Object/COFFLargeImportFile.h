@@ -63,6 +63,7 @@ public:
 
   uint16_t getMachine() const { return getCOFFLargeImportHeader()->Machine; }
 
+  StringRef getSymbolName() const;
   StringRef getFileFormatName() const;
   StringRef getExportName() const;
   StringRef getDllName() const;

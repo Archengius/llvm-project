@@ -36,49 +36,44 @@ public:
 };
 
 // <COFF_LARGE_EXPORTS>
-class LargeIdataContents {
+class LargeLoaderImportDataContents {
 public:
-  void add(DefinedLargeImport *sym) { imports.push_back(sym); }
-  bool empty() { return imports.empty(); }
+  void setupLargeLoaderDllOrder(COFFLinkerContext &ctx, int maxLoadOrder) const;
+  void setupLargeLoaderExportDirectoryInitializer(SymbolTable &symtab);
+  void setupLargeLoaderImportDirectoryInitializer(SymbolTable &symtab);
+  void setupLargeLoaderDllImportDependencies(SymbolTable &symtab, const std::set<StringRef> &dllNameDependencies);
+  void createLargeIdataChunks(SymbolTable &symtab, const std::vector<LargeImportData *> &allLargeImports, std::vector<Chunk *> &chunks);
 
-  void createLoaderImports(COFFLinkerContext &ctx, int maxLoadOrder);
-  ImportFile *createLoaderImport(COFFLinkerContext &ctx, StringRef symbolName);
-  void createLargeLoaderDllImport(COFFLinkerContext &ctx, StringRef dllName);
-  void buildSectionContents(COFFLinkerContext &ctx);
-  void createRegisterInitializerChunk(COFFLinkerContext &ctx);
-  void createUnregisterTerminatorChunk(COFFLinkerContext &ctx);
-  void createLinkInitializerChunk(COFFLinkerContext &ctx);
+  void createLargeLoaderDllImport(SymbolTable &symtab, StringRef dllName);
+  ImportFile *createLoaderImport(SymbolTable &symtab, StringRef symbolName);
+  void createStaticCallbackChunk(SymbolTable &symtab, StringRef name, ImportFile *callbackImport, Defined *callbackParameterSymbol, bool isTerminator = false);
+  Chunk *findOrCreateNameChunk(StringRef name);
 
   std::vector<std::unique_ptr<MemoryBuffer>> loaderImportData;
   std::vector<std::unique_ptr<MemoryBuffer>> dllImportData;
-  ImportFile* loaderInitializeExportsImportFile{};
-  ImportFile* loaderTerminateExportsImportFile{};
-  ImportFile* loaderLinkImportsImportFile{};
-  std::map<StringRef, ImportFile*> dllImportFiles;
-  std::vector<StringRef> importedDllNames;
   std::map<StringRef, size_t> importedDllNameToExportSectionIndex;
-  std::vector<DefinedLargeImport *> imports;
-  Chunk *sectionHeaderChunk{};
-  Chunk *exportsSectionHeaderChunk{};
+
+  // Chunks that will need to be appended to different sections of the final executable
+  // Note that on hybrid binaries (ARM64X), this will contain both ARM64 and ARM64EC chunks
   std::vector<Chunk *> textChunks;
   std::vector<Chunk *> initializerChunks;
   std::vector<Chunk *> terminatorChunks;
-
-  std::vector<Chunk *> addressTableChunks;
-  std::vector<Chunk *> importedExportSectionChunks;
-  std::vector<Chunk *> importChunks;
+  // On hybrid CPPE images, exports will be very similar between ARM64 and ARM64EC compiled code, so we can massively reduce
+  // the size of the final image by reusing the name chunks across both targets
   std::vector<Chunk *> nameChunks;
+  std::map<StringRef, Chunk *> nameChunkLookup;
 };
 
-class LargeEdataContents {
+class LargeLoaderExportDataContents {
 public:
-  LargeEdataContents(COFFLinkerContext &ctx);
+  void createStubEdataChunksForLargeLoader(SymbolTable &symtab, std::vector<Chunk *> &chunks) const;
+  void createLargeEdataChunks(SymbolTable &symtab, std::vector<Chunk *> &chunks);
+  Chunk *findOrCreateNameChunk(StringRef name);
 
-  Chunk *sectionHeaderChunk{};
-  std::vector<Chunk *> exportRVATableChunks;
-  std::vector<Chunk *> exportHashBucketTableChunks;
-  std::vector<Chunk *> exportTableChunks;
+  // On hybrid CPPE images, exports will be very similar between ARM64 and ARM64EC compiled code, so we can massively reduce
+  // the size of the final image by reusing the name chunks across both targets
   std::vector<Chunk *> nameChunks;
+  std::map<StringRef, Chunk *> nameChunkLookup;
 };
 // </COFF_LARGE_EXPORTS>
 
@@ -124,7 +119,6 @@ private:
 
 // Create all chunks for the DLL export table.
 void createEdataChunks(SymbolTable &symtab, std::vector<Chunk *> &chunks);
-
 } // namespace lld::coff
 
 #endif

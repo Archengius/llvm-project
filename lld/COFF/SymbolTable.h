@@ -34,8 +34,8 @@ class LazyArchive;
 class SectionChunk;
 class Symbol;
 // <COFF_LARGE_EXPORTS>
-class DefinedLargeImportData;
-class DefinedLargeImportSynthetic;
+class DefinedLargeImport;
+class LargeImportData;
 // </COFF_LARGE_EXPORTS>
 
 // This data structure is instantiated for each -wrap option.
@@ -139,9 +139,8 @@ public:
   Defined *addImportThunk(StringRef name, DefinedImportData *s,
                           ImportThunkChunk *chunk);
   // <COFF_LARGE_EXPORTS>
-  DefinedLargeImportData *addLargeImportData(StringRef importedName, LargeImportFile *f);
-  DefinedLargeImportSynthetic *addSyntheticLargeImport(StringRef name, StringRef externalName);
-  Defined *addLargeImportThunk(StringRef externalName, DefinedLargeImportData *id, ImportThunkChunk *chunk);
+  DefinedLargeImport *addLargeImport(StringRef importedName, LargeImportData *f, Chunk* &location, bool isARM64ECAuxiliaryIATCodeChunk = false);
+  Defined *addLargeImportThunk(StringRef externalName, DefinedLargeImport *id, ImportThunkChunk *chunk);
   void resolveUndefinedWildcardImportSymbols();
   // </COFF_LARGE_EXPORTS>
   void addLibcall(StringRef name);
@@ -167,8 +166,9 @@ public:
   // A list of EC EXP+ symbols.
   std::vector<Symbol *> expSymbols;
   // <COFF_LARGE_EXPORTS>
-  // A list of synthetic large import symbols. They do not have associated import files, so they are standalone
-  std::vector<Symbol *> syntheticLargeImportSymbols;
+  // Import files for export directories of the DLLs imported by Large Loader
+  std::map<StringRef, ImportFile*> largeLoaderDllImportFiles;
+  std::vector<StringRef> largeLoaderImportedDllNames;
   // </COFF_LARGE_EXPORTS>
 
   // A list of DLL exports.
@@ -188,6 +188,9 @@ public:
   void fixupExports();
   void assignExportOrdinals();
   void parseModuleDefs(StringRef path);
+  // <COFF_LARGE_EXPORTS>
+  void validateLargeExports();
+  // </COFF_LARGE_EXPORTS>
 
   // Iterates symbols in non-determinstic hash table order.
   template <typename T> void forEachSymbol(T callback) {

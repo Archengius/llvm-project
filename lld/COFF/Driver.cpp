@@ -224,6 +224,11 @@ void LinkerDriver::addFile(InputFile *file) {
     } else if (auto *f = dyn_cast<ImportFile>(file)) {
       ctx.importFileInstances.push_back(f);
     }
+    // <COFF_LARGE_EXPORTS>
+    else if (auto *f = dyn_cast<LargeImportFile>(file)) {
+      ctx.largeImportFileInstances.push_back(f);
+    }
+    // </COFF_LARGE_EXPORTS>
   }
 
   MachineTypes mt = file->getMachineType();
@@ -1043,30 +1048,53 @@ void LinkerDriver::createLargeImportLibrary(bool asLib) {
 
   std::string libName = path::filename(getImportName(asLib)).str();
   BumpPtrAllocator localAllocator;
+
+  auto getExports = [&](SymbolTable &symtab, std::vector<NewArchiveMember> &importMembers, MachineTypes Machine) {
+    // Generate large import archive members for each export we have
+    for (Export &exp : symtab.exports) {
+
+      // Skip over private and constant exports
+      if (exp.isPrivate || exp.constant) continue;
+
+      bool isAliasedExport = exp.exportName != exp.name;
+      size_t totalImportSize = sizeof(COFFLargeImportHeader) + exp.name.size() + (ctx.config.forceNoDllNameInLib ? 0 : libName.size()) + (isAliasedExport ? exp.exportName.size() : 0);
+      char *importBufferStart = localAllocator.Allocate<char>(totalImportSize);
+
+      auto *hdr = reinterpret_cast<COFFLargeImportHeader *>(importBufferStart);
+      memcpy(hdr->Signature, LargeImportFileSignature, sizeof(hdr->Signature));
+      hdr->Machine = Machine;
+      hdr->Version = LARGE_LOADER_VERSION_ARM64EC_EXPORTAS;
+      hdr->Type = exp.data ? LARGE_LOADER_IMPORT_TYPE_DATA : LARGE_LOADER_IMPORT_TYPE_CODE;
+      hdr->Flags = LARGE_LOADER_IMPORT_FLAGS_NONE;
+      hdr->SizeOfInternalSymbolName = exp.name.size();
+      hdr->SizeOfDllNameHint = ctx.config.forceNoDllNameInLib ? 0 : libName.size();
+      hdr->SizeOfExternalSymbolName = isAliasedExport ? exp.exportName.size() : 0;
+
+      memcpy(importBufferStart + sizeof(COFFLargeImportHeader), exp.name.data(), exp.name.size());
+      memcpy(importBufferStart + sizeof(COFFLargeImportHeader) + exp.name.size(), libName.data(), ctx.config.forceNoDllNameInLib ? 0 : libName.size());
+      // Only write external symbol name if this is an aliased export
+      if (isAliasedExport)
+        memcpy(importBufferStart + sizeof(COFFLargeImportHeader) + exp.name.size() + (ctx.config.forceNoDllNameInLib ? 0 : libName.size()), exp.exportName.data(), exp.exportName.size());
+
+      importMembers.push_back(NewArchiveMember(MemoryBufferRef(StringRef(importBufferStart, totalImportSize), libName)));
+    }
+  };
+
+  // Adjust the target machine and native machine types if we are linking against Arm64EC
+  MachineTypes targetMachine = ctx.config.machine;
+  MachineTypes nativeMachine = targetMachine;
+  if (isArm64EC(targetMachine)) {
+    nativeMachine = IMAGE_FILE_MACHINE_ARM64;
+    targetMachine = IMAGE_FILE_MACHINE_ARM64EC;
+  }
+
+  // Write either a normal symtab or a hybrid symtab (for ARM64EC). The difference is the source symtab from which symbols come and the machine type the symbols are labelled with
   std::vector<NewArchiveMember> importMembers;
-
-  // Generate large import archive members for each export we have
-  for (Export &exp : ctx.config.exports) {
-
-    // Skip over private and constant exports
-    if (exp.isPrivate || exp.constant) continue;
-
-    size_t totalImportSize = sizeof(COFFLargeImportHeader) + exp.name.size() + (ctx.config.forceNoDllNameInLib ? 0 : libName.size());
-    char *importBufferStart = localAllocator.Allocate<char>(totalImportSize);
-
-    auto *hdr = reinterpret_cast<COFFLargeImportHeader *>(importBufferStart);
-    memcpy(hdr->Signature, LargeImportFileSignature, sizeof(hdr->Signature));
-    hdr->Machine = ctx.config.machine;
-    hdr->Version = 1;
-    hdr->Type = exp.data ? LARGE_LOADER_IMPORT_TYPE_DATA : LARGE_LOADER_IMPORT_TYPE_CODE;
-    hdr->Flags = LARGE_LOADER_IMPORT_FLAGS_NONE;
-    hdr->SizeOfSymbolName = exp.name.size();
-    hdr->SizeOfDllNameHint = ctx.config.forceNoDllNameInLib ? 0 : libName.size();
-
-    memcpy(importBufferStart + sizeof(COFFLargeImportHeader), exp.name.data(), exp.name.size());
-    memcpy(importBufferStart + sizeof(COFFLargeImportHeader) + exp.name.size(), libName.data(), ctx.config.forceNoDllNameInLib ? 0 : libName.size());
-
-    importMembers.push_back(NewArchiveMember(MemoryBufferRef(StringRef(importBufferStart, totalImportSize), libName)));
+  if (ctx.hybridSymtab) {
+    getExports(ctx.symtab, importMembers, nativeMachine);
+    getExports(*ctx.hybridSymtab, importMembers, targetMachine);
+  } else {
+    getExports(ctx.symtab, importMembers, targetMachine);
   }
 
   std::string path = getImplibPath();
@@ -2408,7 +2436,8 @@ void LinkerDriver::linkerMain(ArrayRef<const char *> argsArr) {
     if (!config->noimplib)
       // <COFF_LARGE_EXPORTS> Handle import library generation for large exports
       if (config->largeExports) {
-        validateLargeExports();
+        ctx.forEachSymtab(
+          [](SymbolTable &symtab) { symtab.validateLargeExports(); });
         createLargeImportLibrary(true);
       }
       else
@@ -2585,12 +2614,14 @@ void LinkerDriver::linkerMain(ArrayRef<const char *> argsArr) {
     if (config->debug || config->buildIDHash != BuildIDHash::None)
       if (symtab.findUnderscore("__buildid"))
         symtab.addUndefined(symtab.mangle("__buildid"));
+    // <COFF_LARGE_EXPORTS>
+    // Add the large loader export directory placeholder symbol if large exports are enabled.
+    if (config->largeExports)
+      ctx.symtab.addSynthetic("__large_loader_export_directory", nullptr);
+    // We don't know yet if we have been given any large loader imports, so add the symbol in advance.
+    ctx.symtab.addSynthetic("__large_loader_import_directory", nullptr);
+    // </COFF_LARGE_EXPORTS>
   });
-
-  // <COFF_LARGE_EXPORTS> Add synthetic symbol for the base of large loader exports. It will be defined later when large exports section is written
-  if (config->largeExports)
-    ctx.symtab.addUndefined("__large_loader_exports_base");
-  // </COFF_LARGE_EXPORTS>
 
   // This code may add new undefined symbols to the link, which may enqueue more
   // symbol resolution tasks, so we need to continue executing tasks until we
@@ -2798,7 +2829,8 @@ void LinkerDriver::linkerMain(ArrayRef<const char *> argsArr) {
 
     // <COFF_LARGE_EXPORTS> Handle large import library generation
     if (config->largeExports) {
-      validateLargeExports();
+      ctx.forEachSymtab(
+          [](SymbolTable &symtab) { symtab.validateLargeExports(); });
       createLargeImportLibrary(false);
     } else {
       if (!config->noimplib && (!config->mingw || !config->implib.empty()))

@@ -27,8 +27,9 @@
 #include "llvm/Support/Path.h"
 // <COFF_LARGE_EXPORTS>
 #include "CityHash.h"
+#include "llvm/IR/Mangler.h"
 #include "llvm/Object/COFFLargeImport.h"
-// <COFF_LARGE_EXPORTS>
+// </COFF_LARGE_EXPORTS>
 
 using namespace llvm;
 using namespace llvm::object;
@@ -153,7 +154,7 @@ private:
 };
 
 // A chunk for ARM64EC auxiliary IAT.
-class AuxImportChunk : public NonSectionChunk {
+class  AuxImportChunk : public NonSectionChunk {
 public:
   explicit AuxImportChunk(ImportFile *file) : file(file) {
     setAlignment(sizeof(uint64_t));
@@ -898,24 +899,26 @@ void IdataContents::create(COFFLinkerContext &ctx) {
 // <COFF_LARGE_EXPORTS>
 class LargeImportLoaderCallbackChunk : public NonSectionCodeChunk {
 public:
-  LargeImportLoaderCallbackChunk(Defined* callbackDataSymbol, Chunk* &sectionHeaderChunk) : callbackDataSymbol(callbackDataSymbol), sectionHeaderChunk(sectionHeaderChunk) {}
+  LargeImportLoaderCallbackChunk(Defined* callbackSymbol, Defined* callbackDataSymbol) : callbackSymbol(callbackSymbol), callbackDataSymbol(callbackDataSymbol) {
+    p2Align = 4; // Align to 16 byte boundary
+  }
 protected:
+  Defined *callbackSymbol{};
   Defined *callbackDataSymbol{};
-  Chunk* &sectionHeaderChunk;
 };
 
-// This code will load the base address of the image, and address of the first import descriptor, and then call the large loader link function
 static const uint8_t largeLoaderCallbackX64[] = {
-  0x48, 0x8D, 0x0D, 0x00, 0x00, 0x00, 0x00,       // lea  rcx, [__ImageBase]
-  0x48, 0x8D, 0x15, 0x00, 0x00, 0x00, 0x00,       // lea  rdx, [.ildata]
-  0xFF, 0x25, 0x00, 0x00, 0x00, 0x00,             // jmp [__imp___large_loader_link]
+  0x48, 0x8D, 0x0D, 0x00, 0x00, 0x00, 0x00, // lea  rcx, [ImageBase]
+  0x48, 0x8D, 0x15, 0x00, 0x00, 0x00, 0x00, // lea  rdx, [sectionHeader]
+  0xFF, 0x25, 0x00, 0x00, 0x00, 0x00,       // jmp [callback]
 };
 
 class LargeImportLoaderCallbackChunkX64 : public LargeImportLoaderCallbackChunk {
 public:
-  LargeImportLoaderCallbackChunkX64(Defined *callbackDataSymbol, Chunk* &sectionHeaderChunk) : LargeImportLoaderCallbackChunk(callbackDataSymbol, sectionHeaderChunk) {
-    // Align to the power of 16, just like import thunks
-    p2Align = 4;
+  LargeImportLoaderCallbackChunkX64(Defined* callbackSymbol, Defined* callbackDataSymbol) : LargeImportLoaderCallbackChunk(callbackSymbol, callbackDataSymbol) {}
+
+  MachineTypes getMachine() const override {
+    return IMAGE_FILE_MACHINE_AMD64;
   }
 
   size_t getSize() const override {
@@ -925,39 +928,84 @@ public:
   void writeTo(uint8_t *buf) const override {
     memcpy(buf, largeLoaderCallbackX64, sizeof(largeLoaderCallbackX64));
     write32le(buf + 3, 0 - rva - 7); // __ImageBase is at RVA 0, therefore to get it we need to negate our own RVA and also subtract the size of the current instruction (7 byte lea)
-    write32le(buf + 10, sectionHeaderChunk->getRVA() - rva - 14);
-    write32le(buf + 16, callbackDataSymbol->getRVA() - rva - 20);
+    write32le(buf + 10, callbackDataSymbol->getRVA() - rva - 14);
+    write32le(buf + 16, callbackSymbol->getRVA() - rva - 20);
   }
+};
+
+// Note that this uses x16, which does not map to any x64 register under ARM64EC. However, import thunks do that too, so it should be fine, and we do not expect emulated SEH handlers during static initializer execution
+const uint8_t largeLoaderCallbackARM64[] = {
+  0x00, 0x00, 0x00, 0x90, // adrp x0, ImageBase
+  0x00, 0x00, 0x00, 0x91, // add  x0, x0, :lo12:ImageBase
+  0x01, 0x00, 0x00, 0x90, // adrp x1, sectionHeader
+  0x21, 0x00, 0x00, 0x91, // add  x1, x1, :lo12:sectionHeader
+  0x10, 0x00, 0x00, 0x90, // adrp x16, callback
+  0x10, 0x02, 0x00, 0x91, // add  x16, x16, :lo12:callback
+  0x00, 0x02, 0x1f, 0xd6, // br   x16
+};
+
+class LargeImportLoaderCallbackChunkARM64 : public LargeImportLoaderCallbackChunk {
+public:
+  LargeImportLoaderCallbackChunkARM64(Defined* callbackSymbol, Defined* callbackDataSymbol, MachineTypes machineType) :
+    LargeImportLoaderCallbackChunk(callbackSymbol, callbackDataSymbol), machineType(machineType) {}
+
+  MachineTypes getMachine() const override {
+    return machineType;
+  }
+
+  size_t getSize() const override {
+    return sizeof(largeLoaderCallbackARM64);
+  }
+
+  void writeTo(uint8_t *buf) const override {
+    memcpy(buf, largeLoaderCallbackARM64, sizeof(largeLoaderCallbackARM64));
+    // ImageBase is at RVA 0
+    applyArm64Addr(buf + 0, 0, rva + 0, 12);
+    applyArm64Imm(buf + 4, 0 & 0xfff, 0);
+    // Section Header RVA
+    applyArm64Addr(buf + 8, callbackDataSymbol->getRVA(), rva + 8, 12);
+    applyArm64Imm(buf + 12, callbackDataSymbol->getRVA() & 0xfff, 0);
+    // Callback function RVA
+    applyArm64Addr(buf + 16, callbackSymbol->getRVA(), rva + 16, 12);
+    applyArm64Imm(buf + 18, callbackSymbol->getRVA() & 0xfff, 0);
+  }
+private:
+  MachineTypes machineType;
 };
 
 class AbsoluteDefinedSymbolAddressChunk : public NonSectionChunk {
 public:
-  AbsoluteDefinedSymbolAddressChunk(COFFLinkerContext &context, Defined* definedSymbol) : ctx(context), definedSymbol(definedSymbol) {
+  AbsoluteDefinedSymbolAddressChunk(SymbolTable &symtab, Defined* definedSymbol) : symtab(symtab), definedSymbol(definedSymbol) {
     p2Align = 3; // Address needs to be aligned to 8 byte boundary
+  }
+
+  MachineTypes getMachine() const override {
+    // Machine is important for .CRT section chunks in hybrid binaries, because we do not want ARM64 code to pick up ARM64EC code as a initializer, and vice versa
+    return symtab.machine;
   }
 
   size_t getSize() const override {
     // Size of the pointer is the size of this chunk
-    return ctx.config.wordsize;
+    return symtab.ctx.config.wordsize;
   }
 
   void writeTo(uint8_t *buf) const override {
-    if (ctx.config.is64()) {
-      write64le(buf, definedSymbol->getRVA() + ctx.config.imageBase);
+    if (symtab.ctx.config.is64()) {
+      write64le(buf, definedSymbol->getRVA() + symtab.ctx.config.imageBase);
     } else {
       uint32_t bit = 0;
       // Pointer to thumb code must have the LSB set, so adjust it if the symbols output chunk is marked as Code
-      if (ctx.config.machine == ARMNT && (definedSymbol->getChunk()->getOutputCharacteristics() & IMAGE_SCN_CNT_CODE) != 0)
+      if (symtab.machine == ARMNT && (definedSymbol->getChunk()->getOutputCharacteristics() & IMAGE_SCN_CNT_CODE) != 0)
         bit = 1;
-      write32le(buf, (definedSymbol->getRVA() + ctx.config.imageBase) | bit);
+      write32le(buf, (definedSymbol->getRVA() + symtab.ctx.config.imageBase) | bit);
     }
   }
 
   void getBaserels(std::vector<Baserel> *res) override {
-    res->emplace_back(rva, ctx.config.machine);
+    res->emplace_back(rva, symtab.machine);
   }
 protected:
-  COFFLinkerContext &ctx;
+  SymbolTable &symtab;
   Defined *definedSymbol;
 };
 
@@ -980,23 +1028,26 @@ private:
 
 class LargeLoaderImportSectionHeaderChunk final : public NonSectionChunk {
 public:
-  LargeLoaderImportSectionHeaderChunk(const COFFLargeLoaderImportSectionHeader &header, Chunk *addressTable, Chunk *importedExportSections, Chunk *importTable, Chunk *imageNameChunk) :
-    sectionHeader(header), addressTable(addressTable), importedExportSections(importedExportSections), importTable(importTable), imageNameChunk(imageNameChunk) {
-    setAlignment(alignof(COFFLargeLoaderImportSectionHeader));
+  LargeLoaderImportSectionHeaderChunk(const COFFLargeLoaderImportDirectory &header, Chunk *addressTable, Chunk *auxiliaryAddressTable, Chunk *importedExportSections, Chunk *importTable, Chunk *imageNameChunk) :
+    sectionHeader(header), addressTable(addressTable), auxiliaryAddressTable(auxiliaryAddressTable),
+    importedExportSections(importedExportSections), importTable(importTable), imageNameChunk(imageNameChunk) {
+    setAlignment(alignof(COFFLargeLoaderImportDirectory));
   }
 
   size_t getSize() const override { return sizeof(sectionHeader); }
 
   void writeTo(uint8_t *buf) const override {
     memcpy(buf, &sectionHeader, sizeof(sectionHeader));
-    write32le(buf + offsetof(COFFLargeLoaderImportSectionHeader, AddressTableOffset), addressTable->getRVA() - getRVA());
-    write32le(buf + offsetof(COFFLargeLoaderImportSectionHeader, ImportedExportSectionsOffset), importedExportSections ? importedExportSections->getRVA() - getRVA() : 0);
-    write32le(buf + offsetof(COFFLargeLoaderImportSectionHeader, ImportTableOffset), importTable->getRVA() - getRVA());
-    write32le(buf + offsetof(COFFLargeLoaderImportSectionHeader, ImageFilenameOffset), imageNameChunk->getRVA() - getRVA());
+    write32le(buf + offsetof(COFFLargeLoaderImportDirectory, AddressTableOffset), addressTable->getRVA() - getRVA());
+    write32le(buf + offsetof(COFFLargeLoaderImportDirectory, ImportedExportSectionsOffset), importedExportSections ? importedExportSections->getRVA() - getRVA() : 0);
+    write32le(buf + offsetof(COFFLargeLoaderImportDirectory, ImportTableOffset), importTable->getRVA() - getRVA());
+    write32le(buf + offsetof(COFFLargeLoaderImportDirectory, ImageFilenameOffset), imageNameChunk->getRVA() - getRVA());
+    write32le(buf + offsetof(COFFLargeLoaderImportDirectory, AuxiliaryAddressTableOffset), auxiliaryAddressTable ? auxiliaryAddressTable->getRVA() - getRVA() : 0);
   }
 private:
-  COFFLargeLoaderImportSectionHeader sectionHeader;
+  COFFLargeLoaderImportDirectory sectionHeader;
   Chunk *addressTable;
+  Chunk *auxiliaryAddressTable;
   Chunk *importedExportSections;
   Chunk *importTable;
   Chunk *imageNameChunk;
@@ -1019,13 +1070,13 @@ public:
     Defined *definedSymbol = cast<Defined>(symbol);
 
     if (ctx.config.is64()) {
-      write64le(buf, definedSymbol->getRVA());
+      write64le(buf, definedSymbol ? definedSymbol->getRVA() : 0);
     } else {
       uint32_t bit = 0;
       // Pointer to thumb code must have the LSB set, so adjust it if the symbols output chunk is marked as Code
-      if (ctx.config.machine == ARMNT && (definedSymbol->getChunk()->getOutputCharacteristics() & IMAGE_SCN_CNT_CODE) != 0)
+      if (ctx.config.machine == ARMNT && (definedSymbol && definedSymbol->getChunk()->getOutputCharacteristics() & IMAGE_SCN_CNT_CODE) != 0)
         bit = 1;
-      write32le(buf, definedSymbol->getRVA() | bit);
+      write32le(buf, definedSymbol ? (definedSymbol->getRVA() | bit) : 0);
     }
   }
 private:
@@ -1068,45 +1119,37 @@ private:
 class LargeLoaderExportSectionHeaderChunk final : public NonSectionChunk {
 public:
   LargeLoaderExportSectionHeaderChunk(
-      const COFFLargeLoaderExportSectionHeader &header, Chunk *exportRVATable,
+      const COFFLargeLoaderExportDirectory &header, Chunk *exportRVATable, Chunk *auxExportRVATable,
       Chunk *exportHashBucketTable, Chunk *exportTable, Chunk *imageNameChunk)
-      : sectionHeader(header), exportRVATable(exportRVATable),
+      : sectionHeader(header), exportRVATable(exportRVATable), auxExportRVATable(auxExportRVATable),
         exportHashBucketTable(exportHashBucketTable), exportTable(exportTable),
         imageNameChunk(imageNameChunk) {
-    setAlignment(alignof(COFFLargeLoaderExportSectionHeader));
+    setAlignment(alignof(COFFLargeLoaderExportDirectory));
   }
 
   size_t getSize() const override { return sizeof(sectionHeader); }
 
   void writeTo(uint8_t *buf) const override {
     memcpy(buf, &sectionHeader, sizeof(sectionHeader));
-    write32le(buf + offsetof(COFFLargeLoaderExportSectionHeader,
-                             ExportRVATableOffset),
-              exportRVATable->getRVA() - getRVA());
-    write32le(buf + offsetof(COFFLargeLoaderExportSectionHeader,
-                             ExportHashBucketTableOffset),
-              exportHashBucketTable->getRVA() - getRVA());
-    write32le(
-        buf + offsetof(COFFLargeLoaderExportSectionHeader, ExportTableOffset),
-        exportTable->getRVA() - getRVA());
-    write32le(
-        buf + offsetof(COFFLargeLoaderExportSectionHeader, SectionHeaderRVA),
-        getRVA());
-    write32le(
-        buf + offsetof(COFFLargeLoaderExportSectionHeader, ImageFilenameOffset),
-        imageNameChunk->getRVA() - getRVA());
+    write32le(buf + offsetof(COFFLargeLoaderExportDirectory, ExportRVATableOffset), exportRVATable->getRVA() - getRVA());
+    write32le(buf + offsetof(COFFLargeLoaderExportDirectory, ExportHashBucketTableOffset), exportHashBucketTable->getRVA() - getRVA());
+    write32le(buf + offsetof(COFFLargeLoaderExportDirectory, ExportTableOffset), exportTable->getRVA() - getRVA());
+    write32le(buf + offsetof(COFFLargeLoaderExportDirectory, ExportDirectoryRVA), getRVA());
+    write32le(buf + offsetof(COFFLargeLoaderExportDirectory, ImageFilenameOffset), imageNameChunk->getRVA() - getRVA());
+    write32le(buf + offsetof(COFFLargeLoaderExportDirectory, ExportRVATableOffset), exportRVATable->getRVA() - getRVA());
+    write32le(buf + offsetof(COFFLargeLoaderExportDirectory, AuxExportRVATableOffset), auxExportRVATable ? (auxExportRVATable->getRVA() - getRVA()) : 0);
   }
 
 private:
-  COFFLargeLoaderExportSectionHeader sectionHeader;
+  COFFLargeLoaderExportDirectory sectionHeader;
   Chunk *exportRVATable;
+  Chunk *auxExportRVATable;
   Chunk *exportHashBucketTable;
   Chunk *exportTable;
   Chunk *imageNameChunk;
 };
 
-void LargeIdataContents::createLoaderImports(COFFLinkerContext &ctx, int maxLoadOrder) {
-
+void LargeLoaderImportDataContents::setupLargeLoaderDllOrder(COFFLinkerContext &ctx, int maxLoadOrder) const {
   StringRef loaderLibraryName = saver().save("LargeLoader.dll");
 
   // Make sure the large loader DLL is loaded before any other DLLs with large
@@ -1114,113 +1157,48 @@ void LargeIdataContents::createLoaderImports(COFFLinkerContext &ctx, int maxLoad
   std::string loaderLibraryNameLowercase = loaderLibraryName.lower();
   if (ctx.config.dllOrder.count(loaderLibraryNameLowercase) == 0 || ctx.config.dllOrder[loaderLibraryNameLowercase] > maxLoadOrder)
     ctx.config.dllOrder[loaderLibraryNameLowercase] = maxLoadOrder;
-
-  // Resolve import symbols that we might need from the large loader
-  loaderInitializeExportsImportFile = createLoaderImport(ctx, saver().save("__large_loader_register"));
-  loaderTerminateExportsImportFile = createLoaderImport(ctx, saver().save("__large_loader_unregister"));
-  loaderLinkImportsImportFile = createLoaderImport(ctx, saver().save("__large_loader_link"));
 }
 
-ImportFile* LargeIdataContents::createLoaderImport(COFFLinkerContext &ctx, StringRef symbolName) {
-  StringRef loaderLibraryName = saver().save("LargeLoader.dll");
+void LargeLoaderImportDataContents::setupLargeLoaderExportDirectoryInitializer(SymbolTable &symtab) {
+  Defined *largeLoaderExportDirectorySymbol = dyn_cast_or_null<Defined>(symtab.find("__large_loader_export_directory"));
+  // Create export directory initializer
+  ImportFile *largeLoaderRegisterExportDirImport = createLoaderImport(symtab, saver().save("__large_loader_register"));
+  StringRef staticExportDirectoryInitializerName = symtab.ctx.saver.save("__large_loader_static_register_export_directory");
+  createStaticCallbackChunk(symtab, staticExportDirectoryInitializerName, largeLoaderRegisterExportDirImport, largeLoaderExportDirectorySymbol);
 
-  size_t sizeOfData = (symbolName.size() + 1) + (loaderLibraryName.size() + 1);
-  size_t totalImportSize = sizeof(coff_import_header) + sizeOfData;
-  auto importBuffer = WritableMemoryBuffer::getNewMemBuffer(totalImportSize);
-
-  // Populate the short import header with valid data for a function import by
-  // name and the machine from the config file
-  auto *hdr = reinterpret_cast<coff_import_header *>(importBuffer->getBufferStart());
-  hdr->Sig1 = IMAGE_FILE_MACHINE_UNKNOWN;
-  hdr->Sig2 = 0xFFFF;
-  hdr->Version = 1;
-  hdr->Machine = ctx.config.machine;
-  hdr->SizeOfData = sizeOfData;
-  hdr->TypeInfo = IMPORT_CODE | (IMPORT_NAME << 2);
-
-  // Copy symbol name and DLL name into the import
-  memcpy(importBuffer->getBufferStart() + sizeof(coff_import_header), symbolName.data(), symbolName.size() + 1);
-  memcpy(importBuffer->getBufferStart() + sizeof(coff_import_header) + (symbolName.size() + 1), loaderLibraryName.data(), loaderLibraryName.size() + 1);
-
-  // Create the file and populate it with the data
-  MemoryBuffer &importBufferRef = *importBuffer;
-  loaderImportData.push_back(std::move(importBuffer));
-  ImportFile *loaderImportFile = make<ImportFile>(ctx, importBufferRef);
-  ctx.symtab.addFile(loaderImportFile);
-
-  // At this point, we have already performed the mark live analysis, so just
-  // mark the import as live We do not need the thunk though, so mark it as dead
-  // right away
-  loaderImportFile->live = true;
-  cast<ImportThunkChunk>(loaderImportFile->thunkSym->getChunk())->live = false;
-  return loaderImportFile;
+  // Create export directory terminator
+  ImportFile *largeLoaderUnregisterExportDirImport = createLoaderImport(symtab, saver().save("__large_loader_unregister"));
+  StringRef staticExportDirectoryTerminatorName = symtab.ctx.saver.save("__large_loader_static_unregister_export_directory");
+  createStaticCallbackChunk(symtab, staticExportDirectoryTerminatorName, largeLoaderUnregisterExportDirImport, largeLoaderExportDirectorySymbol, true);
 }
 
-void LargeIdataContents::createRegisterInitializerChunk(COFFLinkerContext &ctx) {
-  // Create callback chunk based on the machine architecture
-  Chunk *callbackCodeChunk = nullptr;
-  if (ctx.config.machine == IMAGE_FILE_MACHINE_AMD64) {
-    callbackCodeChunk = make<LargeImportLoaderCallbackChunkX64>(loaderInitializeExportsImportFile->impSym, exportsSectionHeaderChunk);
-  } else {
-    fatal("Large Loader does not support architectures besides AMD64");
+void LargeLoaderImportDataContents::setupLargeLoaderImportDirectoryInitializer(SymbolTable &symtab) {
+  ImportFile *largeLoaderLinkImport = createLoaderImport(symtab, saver().save("__large_loader_link"));
+  StringRef staticLinkInitializerName = symtab.ctx.saver.save("__large_loader_static_link");
+  Defined *largeLoaderImportDirectorySymbol = dyn_cast_or_null<Defined>(symtab.find("__large_loader_import_directory"));
+
+  createStaticCallbackChunk(symtab, staticLinkInitializerName, largeLoaderLinkImport, largeLoaderImportDirectorySymbol);
+}
+
+void LargeLoaderImportDataContents::setupLargeLoaderDllImportDependencies(SymbolTable &symtab, const std::set<StringRef> &dllNameDependencies) {
+  // Sort DLL synthetic imports in DLL load order
+  std::vector<StringRef> sortedDllNames{dllNameDependencies.begin(), dllNameDependencies.end()};
+  stable_sort(sortedDllNames, [&](const StringRef& dllNameA, const StringRef& dllNameB) {
+    std::string dllNameLowercaseA = dllNameA.lower();
+    std::string dllNameLowercaseB = dllNameB.lower();
+
+    // Sort by the loading order. Entries with lower loading order go first
+    return symtab.ctx.config.dllOrder[dllNameLowercaseA] < symtab.ctx.config.dllOrder[dllNameLowercaseB];
+  });
+
+  // Create synthetic large loader imports for these DLLs
+  for (const StringRef& dllName : sortedDllNames) {
+    createLargeLoaderDllImport(symtab, dllName);
   }
-
-  StringRef symbolName = ctx.saver.save("__large_loader_exports_initializer");
-  Symbol* callbackSymbol = ctx.symtab.addSynthetic(symbolName, callbackCodeChunk);
-
-  // Make sure the loader callback symbol has not been overwritten
-  if (!isa<DefinedSynthetic>(callbackSymbol))
-    fatal("Large Import Loader Exports Initializer symbol " + callbackSymbol->getName() + " has been replaced");
-
-  // Create the chunk for the address of the initializer
-  textChunks.push_back(callbackCodeChunk);
-  initializerChunks.push_back(make<AbsoluteDefinedSymbolAddressChunk>(ctx, cast<Defined>(callbackSymbol)));
 }
 
-void LargeIdataContents::createUnregisterTerminatorChunk(COFFLinkerContext &ctx) {
-  // Create callback chunk based on the machine architecture
-  Chunk *callbackCodeChunk = nullptr;
-  if (ctx.config.machine == IMAGE_FILE_MACHINE_AMD64) {
-    callbackCodeChunk = make<LargeImportLoaderCallbackChunkX64>(loaderTerminateExportsImportFile->impSym, exportsSectionHeaderChunk);
-  } else {
-    fatal("Large Loader does not support architectures besides AMD64");
-  }
-
-  StringRef symbolName = ctx.saver.save("__large_loader_exports_terminator");
-  Symbol* callbackSymbol = ctx.symtab.addSynthetic(symbolName, callbackCodeChunk);
-
-  // Make sure the loader callback symbol has not been overwritten
-  if (!isa<DefinedSynthetic>(callbackSymbol))
-    fatal("Large Import Loader Exports Terminator symbol " + callbackSymbol->getName() + " has been replaced");
-
-  // Create the chunk for the address of the initializer
-  textChunks.push_back(callbackCodeChunk);
-  terminatorChunks.push_back(make<AbsoluteDefinedSymbolAddressChunk>(ctx, cast<Defined>(callbackSymbol)));
-}
-
-void LargeIdataContents::createLinkInitializerChunk(COFFLinkerContext &ctx) {
-  // Create callback chunk based on the machine architecture
-  Chunk *callbackCodeChunk = nullptr;
-  if (ctx.config.machine == IMAGE_FILE_MACHINE_AMD64) {
-    callbackCodeChunk = make<LargeImportLoaderCallbackChunkX64>(loaderLinkImportsImportFile->impSym, sectionHeaderChunk);
-  } else {
-    fatal("Large Loader does not support architectures besides AMD64");
-  }
-
-  StringRef symbolName = ctx.saver.save("__large_loader_link_initializer");
-  Symbol* callbackSymbol = ctx.symtab.addSynthetic(symbolName, callbackCodeChunk);
-
-  // Make sure the loader callback symbol has not been overwritten
-  if (!isa<DefinedSynthetic>(callbackSymbol))
-    fatal("Large Import Loader Link Initializer symbol " + callbackSymbol->getName() + " has been replaced");
-
-  // Create the chunk for the address of the initializer
-  textChunks.push_back(callbackCodeChunk);
-  initializerChunks.push_back(make<AbsoluteDefinedSymbolAddressChunk>(ctx, cast<Defined>(callbackSymbol)));
-}
-
-void LargeIdataContents::createLargeLoaderDllImport(COFFLinkerContext &ctx, StringRef dllName) {
-  StringRef externalSymbolName = saver().save("__large_loader_exports_base");
+void LargeLoaderImportDataContents::createLargeLoaderDllImport(SymbolTable &symtab, StringRef dllName) {
+  StringRef externalSymbolName = saver().save("__large_loader_export_directory");
 
   // Create local symbol name prefixed with the name of the DLL without the
   // extension, to avoid conflicts between different DLLs
@@ -1239,11 +1217,11 @@ void LargeIdataContents::createLargeLoaderDllImport(COFFLinkerContext &ctx, Stri
   hdr->Sig1 = IMAGE_FILE_MACHINE_UNKNOWN;
   hdr->Sig2 = 0xFFFF;
   hdr->Version = 1;
-  hdr->Machine = ctx.config.machine;
+  hdr->Machine = symtab.machine;
   hdr->SizeOfData = sizeOfData;
   // This is large exports section start being imported, so it is data
   // We use NAME_EXPORTAS because symbol being imported is always called
-  // __large_loader_exports_base, but we cannot export it as such into
+  // __large_loader_export_directory, but we cannot export it as such into
   // this file because the name would conflict between different DLLs So we
   // append the name of the DLL to the local name of the export, but use the
   // original name as external name that linker will look up
@@ -1255,12 +1233,12 @@ void LargeIdataContents::createLargeLoaderDllImport(COFFLinkerContext &ctx, Stri
   memcpy(importBuffer->getBufferStart() + sizeof(coff_import_header) + (localSymbolName.size() + 1) + (dllName.size() + 1), externalSymbolName.data(), externalSymbolName.size() + 1);
 
   // Create the file and populate it with the data
-  ImportFile *dllImportFile = make<ImportFile>(ctx, *importBuffer);
+  ImportFile *dllImportFile = make<ImportFile>(symtab.ctx, *importBuffer);
   dllImportData.push_back(std::move(importBuffer));
-  dllImportFiles[dllName] = dllImportFile;
-  importedDllNames.push_back(dllName);
+  symtab.largeLoaderDllImportFiles[dllName] = dllImportFile;
+  symtab.largeLoaderImportedDllNames.push_back(dllName);
 
-  ctx.symtab.addFile(dllImportFile);
+  symtab.ctx.driver.addFile(dllImportFile);
   // At this point, we have already performed the mark live analysis, so just mark the import as live
   dllImportFile->live = true;
 
@@ -1269,43 +1247,137 @@ void LargeIdataContents::createLargeLoaderDllImport(COFFLinkerContext &ctx, Stri
     fatal("Large Import Dll symbol has been replaced for DLL " + dllName);
 }
 
-void LargeIdataContents::buildSectionContents(COFFLinkerContext &ctx) {
+ImportFile* LargeLoaderImportDataContents::createLoaderImport(SymbolTable &symtab, StringRef symbolName) {
+  StringRef loaderLibraryName = saver().save("LargeLoader.dll");
 
-  // Create chunks for imported export sections
-  for (const StringRef &importedDllName : importedDllNames) {
-    Symbol* dllImportExportSectionStartSymbol = dllImportFiles[importedDllName]->impSym;
+  size_t sizeOfData = (symbolName.size() + 1) + (loaderLibraryName.size() + 1);
+  size_t totalImportSize = sizeof(coff_import_header) + sizeOfData;
+  auto importBuffer = WritableMemoryBuffer::getNewMemBuffer(totalImportSize);
+
+  // Populate the short import header with valid data for a function import by
+  // name and the machine from the config file
+  auto *hdr = reinterpret_cast<coff_import_header *>(importBuffer->getBufferStart());
+  hdr->Sig1 = IMAGE_FILE_MACHINE_UNKNOWN;
+  hdr->Sig2 = 0xFFFF;
+  hdr->Version = 1;
+  hdr->Machine = symtab.machine;
+  hdr->SizeOfData = sizeOfData;
+  hdr->TypeInfo = IMPORT_CODE | (IMPORT_NAME << 2);
+
+  // Copy symbol name and DLL name into the import
+  memcpy(importBuffer->getBufferStart() + sizeof(coff_import_header), symbolName.data(), symbolName.size() + 1);
+  memcpy(importBuffer->getBufferStart() + sizeof(coff_import_header) + (symbolName.size() + 1), loaderLibraryName.data(), loaderLibraryName.size() + 1);
+
+  // Create the file and populate it with the data
+  MemoryBuffer &importBufferRef = *importBuffer;
+  loaderImportData.push_back(std::move(importBuffer));
+  ImportFile *loaderImportFile = make<ImportFile>(symtab.ctx, importBufferRef);
+  symtab.ctx.driver.addFile(loaderImportFile);
+
+  // At this point, we have already performed the mark live analysis, so just
+  // mark the import as live We do not need the thunk though, so mark it as dead
+  // right away
+  loaderImportFile->live = true;
+  cast<ImportThunkChunk>(loaderImportFile->thunkSym->getChunk())->live = false;
+  return loaderImportFile;
+}
+
+void LargeLoaderImportDataContents::createStaticCallbackChunk(
+    SymbolTable &symtab, StringRef name, ImportFile *callbackImport,
+    Defined *callbackParameterSymbol, bool isTerminator) {
+  // Create callback chunk based on the machine architecture
+  Chunk *callbackCodeChunk = nullptr;
+  if (symtab.machine == IMAGE_FILE_MACHINE_AMD64) {
+    // No auxiliary IAT on AMD64, use normal import symbol
+    callbackCodeChunk = make<LargeImportLoaderCallbackChunkX64>(
+        callbackImport->impSym, callbackParameterSymbol);
+  } else if (symtab.machine == IMAGE_FILE_MACHINE_ARM64) {
+    // No auxiliary IAT on ARM64, use normal import symbol
+    callbackCodeChunk = make<LargeImportLoaderCallbackChunkARM64>(
+        callbackImport->impSym, callbackParameterSymbol, ARM64);
+  } else if (symtab.machine == IMAGE_FILE_MACHINE_ARM64EC ||
+             symtab.machine == IMAGE_FILE_MACHINE_ARM64X) {
+    // ARM64EC has an auxiliary IAT. Normal import symbol in this case points to
+    // the auxiliary IAT, but this callback is native ARM64EC code running
+    // without emulation, so we need to use EC import symbol, that will always
+    // point to native ARM64EC code
+    callbackCodeChunk = make<LargeImportLoaderCallbackChunkARM64>(
+        callbackImport->impECSym, callbackParameterSymbol, ARM64EC);
+  } else {
+    fatal("Large Loader does not support 32-bit architectures I386 and ARMNT.");
+  }
+  Symbol *callbackSymbol =
+      symtab.ctx.symtab.addSynthetic(name, callbackCodeChunk);
+
+  // Make sure the loader callback symbol has not been overwritten
+  if (!isa<DefinedSynthetic>(callbackSymbol))
+    fatal("Large Loader Internal callback symbol " + callbackSymbol->getName() +
+          " has been replaced");
+
+  // Create the chunk for the address of the initializer
+  textChunks.push_back(callbackCodeChunk);
+  Chunk *symbolAddressChunk = make<AbsoluteDefinedSymbolAddressChunk>(
+      symtab, cast<Defined>(callbackSymbol));
+  if (isTerminator)
+    terminatorChunks.push_back(symbolAddressChunk);
+  else
+    initializerChunks.push_back(symbolAddressChunk);
+}
+
+void LargeLoaderImportDataContents::createLargeIdataChunks(SymbolTable &symtab, const std::vector<LargeImportData *> &allLargeImports, std::vector<Chunk *> &chunks) {
+  std::vector<Chunk *> addressTableChunks;
+  std::vector<Chunk *> auxiliaryAddressTableChunks;
+  std::vector<Chunk *> importedDllExportDirectoryChunks;
+  std::vector<Chunk *> importChunks;
+
+  // Create chunks for imported large loader export directories from imported DLLs
+  for (const StringRef &importedDllName : symtab.largeLoaderImportedDllNames) {
+    Symbol* dllImportExportSectionStartSymbol = symtab.largeLoaderDllImportFiles[importedDllName]->impSym;
 
     // Make sure DLL import symbol has not been replaced by user symbol
     if (!isa<DefinedImportData>(dllImportExportSectionStartSymbol))
       fatal("Large Import Dll Symbol has been replaced for DLL " + importedDllName);
 
     // Create the address chunk, and map the dll name to the index of the chunk in the list
-    Chunk* exportSectionStartAddressChunk = make<AbsoluteDefinedSymbolAddressChunk>(ctx, cast<Defined>(dllImportExportSectionStartSymbol));
-    importedDllNameToExportSectionIndex[importedDllName] = importedExportSectionChunks.size();
-    importedExportSectionChunks.push_back(exportSectionStartAddressChunk);
+    Chunk* exportSectionStartAddressChunk = make<AbsoluteDefinedSymbolAddressChunk>(symtab, cast<Defined>(dllImportExportSectionStartSymbol));
+    importedDllNameToExportSectionIndex[importedDllName] = importedDllExportDirectoryChunks.size();
+    importedDllExportDirectoryChunks.push_back(exportSectionStartAddressChunk);
   }
 
   // Create address table chunk for each import
-  for (DefinedLargeImport* largeImport : imports) {
-    Chunk *addressTableEntryChunk = make<NullChunk>(ctx.config.wordsize);
-
-    largeImport->setLocation(addressTableEntryChunk);
+  for (LargeImportData *largeImportData : allLargeImports) {
+    // Addresses need to be aligned to the 8 byte boundary
+    Chunk *addressTableEntryChunk = make<NullChunk>(symtab.ctx.config.wordsize, 8);
     addressTableChunks.push_back(addressTableEntryChunk);
+    largeImportData->impSym->setLocation(addressTableEntryChunk);
+
+    // If we are building for ARM64EC, we need to also create the auxiliary IAT table
+    // That table might not be fully populated by the linker, so we have to conservatively populate it with impchk thunks if they exist
+    if (isArm64EC(symtab.machine)) {
+      // Take the absolute address of the IAT import thunk if we have one, or use null chunk instead otherwise
+      Chunk *auxiliaryAddressTableEntryChunk = nullptr;
+      if (largeImportData->impchkThunk) {
+        auxiliaryAddressTableEntryChunk = make<AbsoluteDefinedSymbolAddressChunk>(symtab, largeImportData->impchkThunk->sym);
+      } else {
+        // Addresses need to be aligned to the 8 byte boundary. The alignment here must match the alignment of AbsoluteDefinedSymbolAddressChunk
+        auxiliaryAddressTableEntryChunk = make<NullChunk>(symtab.ctx.config.wordsize, 8);
+      }
+      auxiliaryAddressTableChunks.push_back(auxiliaryAddressTableEntryChunk);
+      largeImportData->impECSym->setLocation(auxiliaryAddressTableEntryChunk);
+    }
   }
 
   // Create import chunk for each import
-  for (const DefinedLargeImport *largeImport : imports) {
-
+  for (const LargeImportData *largeImportData : allLargeImports) {
     // Create chunk with the external name of the import
-    Chunk *importNameChunk = make<StringChunk>(largeImport->getExternalName());
-    nameChunks.push_back(importNameChunk);
+    Chunk *importNameChunk = findOrCreateNameChunk(largeImportData->externalName);
 
     // Create import map entry chunk
     COFFLargeLoaderImport import{};
     // If dll name is empty, set export section index to 0xFFFF to indicate a wildcard import
-    import.ExportSectionIndex = largeImport->getDLLName().empty() ? 0xFFFF : static_cast<uint16_t>(importedDllNameToExportSectionIndex.find(largeImport->getDLLName())->second);
-    import.ImportKind = largeImport->getImportType();
-    import.ImportFlags = largeImport->getImportFlags();
+    import.ExportSectionIndex = largeImportData->dllName.empty() ? 0xFFFF : static_cast<uint16_t>(importedDllNameToExportSectionIndex.find(largeImportData->dllName)->second);
+    import.ImportKind = largeImportData->importType;
+    import.ImportFlags = largeImportData->importFlags;
     import.NameLen = importNameChunk->getSize() - 1; // do not count null terminator as a part of name length
 
     Chunk* importChunk = make<LargeLoaderImportChunk>(import, importNameChunk);
@@ -1313,65 +1385,171 @@ void LargeIdataContents::buildSectionContents(COFFLinkerContext &ctx) {
   }
 
   // Create image name chunk
-  Chunk *imageNameChunk = make<StringChunk>(sys::path::filename(ctx.config.outputFile));
-  nameChunks.push_back(imageNameChunk);
+  Chunk *imageNameChunk = findOrCreateNameChunk(sys::path::filename(symtab.ctx.config.outputFile));
 
   // Create import section header chunk
-  COFFLargeLoaderImportSectionHeader sectionHeader{};
-  sectionHeader.Version = 1;
-  sectionHeader.NumExportSections = static_cast<uint16_t>(importedExportSectionChunks.size());
+  COFFLargeLoaderImportDirectory sectionHeader{};
+  sectionHeader.Version = LARGE_LOADER_VERSION_ARM64EC_EXPORTAS;
+  sectionHeader.NumExportSections = static_cast<uint16_t>(importedDllExportDirectoryChunks.size());
   sectionHeader.NumImports = static_cast<uint32_t>(importChunks.size());
   sectionHeader.SingleImportSize = static_cast<uint32_t>(importChunks[0]->getSize());
   sectionHeader.ImageFilenameLength = static_cast<uint32_t>(imageNameChunk->getSize() - 1);
 
   // Imported export section chunks are optional, if all imports are wildcard we will not have any
-  Chunk *firstImportedSectionsChunk = importedExportSectionChunks.empty() ? nullptr : importedExportSectionChunks[0];
-  sectionHeaderChunk = make<LargeLoaderImportSectionHeaderChunk>(sectionHeader, addressTableChunks[0], firstImportedSectionsChunk, importChunks[0], imageNameChunk);
+  Chunk *firstImportedExportDirectoryChunk = importedDllExportDirectoryChunks.empty() ? nullptr : importedDllExportDirectoryChunks[0];
+  Chunk *firstAuxAddressTableChunk = auxiliaryAddressTableChunks.empty() ? nullptr : auxiliaryAddressTableChunks[0];
+  Chunk *importDirectoryChunk = make<LargeLoaderImportSectionHeaderChunk>(sectionHeader, addressTableChunks[0], firstAuxAddressTableChunk, firstImportedExportDirectoryChunk, importChunks[0], imageNameChunk);
+
+  // Replace the large loader import directory created by the Driver on startup with a defined synthetic symbol pointing at the directory chunk
+  Symbol *importDirectorySymbol = symtab.find("__large_loader_import_directory");
+  if (!isa<DefinedSynthetic>(importDirectorySymbol))
+    fatal("Large Loader import directory symbol has been replaced");
+  replaceSymbol<DefinedSynthetic>(importDirectorySymbol, importDirectorySymbol->getName(), importDirectoryChunk);
+
+  // Build the final contents of the future lidata section from the generated chunks
+  chunks.push_back(importDirectoryChunk);
+  chunks.insert(chunks.end(), addressTableChunks.begin(), addressTableChunks.end());
+  chunks.insert(chunks.end(), importedDllExportDirectoryChunks.begin(), importedDllExportDirectoryChunks.end());
+  chunks.insert(chunks.end(), importChunks.begin(), importChunks.end());
+  chunks.insert(chunks.end(), auxiliaryAddressTableChunks.begin(), auxiliaryAddressTableChunks.end());
+}
+
+Chunk *LargeLoaderImportDataContents::findOrCreateNameChunk(StringRef name) {
+  if (const auto iterator = nameChunkLookup.find(name); iterator != nameChunkLookup.end()) {
+    return iterator->second;
+  }
+  Chunk *newNameChunk = make<StringChunk>(name);
+  nameChunks.push_back(newNameChunk);
+  nameChunkLookup.insert({name, newNameChunk});
+  return newNameChunk;
 }
 
 struct LargeExportData {
-  Defined* exportSymbol{};
+  // Auxiliary export symbol is only set for ARM64EC target
+  // For ARM64EC, auxiliary export table points to native ARM64EC code (original function name mangled), while main export table points to emulated x64 code
+  Defined *exportSymbol{};
+  Defined *auxExportSymbol{};
   StringRef exportName;
-  uint16_t exportKind{};
+  uint8_t exportKind{};
   uint64_t exportHash{};
 };
 
-LargeEdataContents::LargeEdataContents(COFFLinkerContext &ctx) {
+void LargeLoaderExportDataContents::createStubEdataChunksForLargeLoader(SymbolTable &symtab, std::vector<Chunk *>& chunks) const {
+  // When building large exports, we only want to emit a single normal export, which points to the large loader export directory
+  Chunk *dllNameChunk = make<StringChunk>(sys::path::filename(symtab.ctx.config.outputFile));
+  Chunk *exportedSymbolNameChunk = make<StringChunk>("__large_loader_export_directory");
+  Symbol *exportDirectorySymbol = symtab.find("__large_loader_export_directory");
+  if (!isa<DefinedSynthetic>(exportDirectorySymbol))
+    fatal("Large Loader Export Directory symbol has been replaced");
+
+  Chunk *addressTab = make<SymbolRVAChunk>(symtab.ctx, exportDirectorySymbol);
+  Chunk *ordinalTab = make<NullChunk>(sizeof(uint16_t), 1); // since we only have a single export, it's unbiased ordinal is always 0, written as uint16_t
+  std::vector<Chunk *> exportNames = {exportedSymbolNameChunk};
+  Chunk *nameTab = make<NamePointersChunk>(exportNames); // only have a single name for a single export
+  Chunk *dir = make<ExportDirectoryChunk>(1, 1, 1, dllNameChunk, addressTab, nameTab, ordinalTab); // base ordinal is 1, max ordinal is 1, name count is 1
+
+  chunks.push_back(dir);
+  chunks.push_back(dllNameChunk);
+  chunks.push_back(addressTab);
+  chunks.push_back(nameTab);
+  chunks.push_back(ordinalTab);
+  chunks.push_back(exportedSymbolNameChunk);
+}
+
+void LargeLoaderExportDataContents::createLargeEdataChunks(SymbolTable &symtab, std::vector<Chunk *>& chunks) {
 
   // Determine a number of hash buckets. We want 2 to 3 elements per hash bucket, at least 1 bucket, and only 1 bucket if there is less than 4 imports
-  size_t numberOfExports = static_cast<uint32_t>(ctx.config.exports.size());
+  size_t numberOfExports = static_cast<uint32_t>(symtab.exports.size());
   size_t numberOfHashBuckets = numberOfExports >= 4 ? std::max<size_t>(numberOfExports / 3, 1) : 1;
   uint16_t hashingAlgo = LARGE_LOADER_HASH_ALGO_CityHash64;
 
   std::vector<SmallVector<size_t, 4>> exportHashBuckets;
   exportHashBuckets.insert(exportHashBuckets.end(), numberOfHashBuckets, SmallVector<size_t, 4>());
-  std::vector<LargeExportData*> allExportData;
+  std::vector<LargeExportData *> allExportData;
+  std::map<StringRef, LargeExportData *> exportDataByNameLookup;
 
   // Assign exports into their relevant buckets
-  for (Export &exp : ctx.config.exports) {
+  for (Export &exp : symtab.exports) {
     // Make sure the symbol this export represents is actually defined
     if (!isa<Defined>(exp.sym))
       fatal("Symbol is not defined for export " + exp.sym->getName());
 
-    // Create export data object for this export
-    LargeExportData* exportData = make<LargeExportData>();
-    exportData->exportSymbol = cast<Defined>(exp.sym);
-    exportData->exportName = exp.exportName;
-    exportData->exportKind = exp.data ? LARGE_LOADER_IMPORT_TYPE_DATA : LARGE_LOADER_IMPORT_TYPE_CODE;
+    // Determine the actual name of the export. That means removing the ARM64EC mangling prefix on ARM64EC
+    StringRef exportName = exp.name;
+    bool bIsARM64ECNativeSymbol = false;
+    if (isArm64EC(symtab.machine)) {
+      if (std::optional<std::string> demangledName = getArm64ECDemangledFunctionName(exp.name); demangledName.has_value()){
+        exportName = symtab.ctx.saver.save(demangledName.value());
+        bIsARM64ECNativeSymbol = true;
+      }
+    }
+    uint8_t exportKind = exp.data ? LARGE_LOADER_IMPORT_TYPE_DATA : LARGE_LOADER_IMPORT_TYPE_CODE;
+    LargeExportData* exportData = nullptr;
 
-    // Determine the hash of the export name. Note that export hash does not include the null terminator
-    if (hashingAlgo == LARGE_LOADER_HASH_ALGO_CityHash64)
-      exportData->exportHash = CityHash64(exportData->exportName.data(), exportData->exportName.size());
-    else
-      fatal("Unknown export hashing algorithm provided");
+    // If we already have an export with this name, just append the additional symbol to it
+    if (const auto iterator = exportDataByNameLookup.find(exportName); iterator != exportDataByNameLookup.end()) {
+      exportData = iterator->second;
 
-    // Add the export to the relevant export bucket and to the global list
-    size_t exportIndex = allExportData.size();
-    size_t exportBucketIndex = exportData->exportHash % numberOfHashBuckets;
+      // Make sure the export kind is the same for both symbols
+      if (exportData->exportKind != exportKind)
+        fatal("Duplicate export with the same name but different kind (data or code): " + exportName);
+    } else {
+      // Create a new export data and set its name, kind and hash otherwise.
+      exportData = make<LargeExportData>();
 
-    exportHashBuckets[exportBucketIndex].push_back(exportIndex);
-    allExportData.push_back(exportData);
+      exportData->exportName = exportName;
+      exportData->exportKind = exportKind;
+
+      // Determine the hash of the export name. Note that export hash does not include the null terminator
+      if (hashingAlgo == LARGE_LOADER_HASH_ALGO_CityHash64)
+        exportData->exportHash = CityHash64(exportData->exportName.data(), exportData->exportName.size());
+      else
+        fatal("Unknown export hashing algorithm provided for Large Loader");
+
+      // Add the export to the relevant export bucket and to the global list
+      size_t exportIndex = allExportData.size();
+      size_t exportBucketIndex = exportData->exportHash % numberOfHashBuckets;
+
+      exportHashBuckets[exportBucketIndex].push_back(exportIndex);
+      allExportData.push_back(exportData);
+    }
+
+    // Determine to which IAT slot this symbol goes for the export. ARM64EC goes into
+    Defined* &resultSymbolSlot = bIsARM64ECNativeSymbol ? exportData->auxExportSymbol : exportData->exportSymbol;
+
+    // Make sure there is no duplicate export definition for this slot
+    if (resultSymbolSlot != nullptr && exp.sym != resultSymbolSlot)
+      fatal("Duplicate export definition for name " + exportName + ". Export points both at symbol " + resultSymbolSlot->getName() + " and symbol " + exp.sym->getName());
+
+    // Assign this symbol to the export slot
+    resultSymbolSlot = cast<Defined>(exp.sym);
   }
+
+  // Make sure we have correct data for both main and auxiliary IAT when building export directory for ARM64EC targets
+  if (isArm64EC(symtab.machine)) {
+    for (LargeExportData *exportData : allExportData) {
+
+      // We must always have a valid main export symbol
+      if (!exportData->exportSymbol && exportData->auxExportSymbol) {
+        // If we have no explicit symbol for the main export, point it to the native ARM64EC auxiliary symbol
+        // X64 emulator is smart enough to know when X64 code attempts to call into native ARM64EC code, so just point main IAT entry to the native ARM64EC export
+        exportData->exportSymbol = exportData->auxExportSymbol;
+      }
+      // It is possible for us to have the main export symbol, but no auxiliary IAT symbol
+      else if (exportData->exportSymbol && !exportData->auxExportSymbol) {
+        // Leave ARM64EC auxiliary IAT slot empty for code, ARM64EC binaries do not expect aux IAT slots for code to always be populated,
+        // and have fallback thunks capable of entering X64 emulator and executing X64 code from main IAT slot as a fallback
+        // However, if this export represents data, we can just point auxiliary IAT symbol to the same symbol as the main symbol
+        if (exportData->exportKind == LARGE_LOADER_IMPORT_TYPE_DATA)
+          exportData->auxExportSymbol = exportData->exportSymbol;
+      }
+    }
+  }
+
+  std::vector<Chunk *> exportRVATableChunks;
+  std::vector<Chunk *> exportAuxRVATableChunks;
+  std::vector<Chunk *> exportHashBucketTableChunks;
+  std::vector<Chunk *> exportTableChunks;
 
   // Arrange exports in the order of the hash buckets, and then in their order inside the bucket
   for (const SmallVector<size_t, 4>& hashBucketContents : exportHashBuckets) {
@@ -1387,11 +1565,18 @@ LargeEdataContents::LargeEdataContents(COFFLinkerContext &ctx) {
     for (size_t exportIndex : hashBucketContents) {
       LargeExportData* exportData = allExportData[exportIndex];
 
-      // Add export RVA table entry for this export
-      exportRVATableChunks.push_back(make<SymbolRVAChunk>(ctx, exportData->exportSymbol));
+      if (!isArm64EC(symtab.machine)) {
+        // Add export RVA table entry for this export
+        exportRVATableChunks.push_back(make<SymbolRVAChunk>(symtab.ctx, exportData->exportSymbol));
+      } else {
+        // Add export RVA table entry (for x64 emulated code)
+        exportRVATableChunks.push_back(make<SymbolRVAChunk>(symtab.ctx, exportData->exportSymbol));
+        // Add aux export RVA table entry (for native ARM64EC code). This can be null in case of code export that is only available in X64
+        exportRVATableChunks.push_back(make<SymbolRVAChunk>(symtab.ctx, exportData->auxExportSymbol));
+      }
 
       // Add name chunk for this export name
-      Chunk *exportNameChunk = make<StringChunk>(exportData->exportName);
+      Chunk *exportNameChunk = findOrCreateNameChunk(exportData->exportName);
       nameChunks.push_back(exportNameChunk);
 
       // Build large export for this export data and add it to the list
@@ -1405,25 +1590,45 @@ LargeEdataContents::LargeEdataContents(COFFLinkerContext &ctx) {
   }
 
   // Create image name chunk
-  Chunk *imageNameChunk = make<StringChunk>(sys::path::filename(ctx.config.outputFile));
+  Chunk *imageNameChunk = findOrCreateNameChunk(sys::path::filename(symtab.ctx.config.outputFile));
   nameChunks.push_back(imageNameChunk);
 
   // Create export section header now
-  COFFLargeLoaderExportSectionHeader sectionHeader{};
-  sectionHeader.Version = 1;
-  sectionHeader.HashingAlgorithm = hashingAlgo;
-  sectionHeader.NumExportBuckets = static_cast<uint32_t>(exportHashBucketTableChunks.size());
-  sectionHeader.NumExports = static_cast<uint32_t>(exportTableChunks.size());
-  sectionHeader.SingleExportSize = static_cast<uint32_t>(exportTableChunks[0]->getSize());
-  sectionHeader.ImageFilenameLength = static_cast<uint32_t>(imageNameChunk->getSize() - 1);
+  COFFLargeLoaderExportDirectory exportDirectory{};
+  exportDirectory.Version = LARGE_LOADER_VERSION_ARM64EC_EXPORTAS;
+  exportDirectory.HashingAlgorithm = hashingAlgo;
+  exportDirectory.NumExportBuckets = static_cast<uint32_t>(exportHashBucketTableChunks.size());
+  exportDirectory.NumExports = static_cast<uint32_t>(exportTableChunks.size());
+  exportDirectory.SingleExportSize = static_cast<uint32_t>(exportTableChunks[0]->getSize());
+  exportDirectory.ImageFilenameLength = static_cast<uint32_t>(imageNameChunk->getSize() - 1);
 
-  sectionHeaderChunk = make<LargeLoaderExportSectionHeaderChunk>(sectionHeader, exportRVATableChunks[0], exportHashBucketTableChunks[0], exportTableChunks[0], imageNameChunk);
+  Chunk *exportDirectoryChunk = make<LargeLoaderExportSectionHeaderChunk>(exportDirectory,
+    exportRVATableChunks[0], exportAuxRVATableChunks.empty() ? nullptr : exportAuxRVATableChunks[0], exportHashBucketTableChunks[0], exportTableChunks[0], imageNameChunk);
 
-  // Replace the large loader exports base symbol created by the Driver on startup with a defined synthetic symbol pointing at the start of the section
-  Symbol *exportsBaseSymbol = ctx.symtab.addSynthetic("__large_loader_exports_base", sectionHeaderChunk);
-  if (!isa<DefinedSynthetic>(exportsBaseSymbol))
-    fatal("Large loaders exports base symbol has been replaced");
+  // Replace the large loader export directory created by the Driver on startup with a defined synthetic symbol pointing at the start of the section
+  Symbol *exportDirectorySymbol = symtab.find("__large_loader_export_directory");
+  if (!isa<DefinedSynthetic>(exportDirectorySymbol))
+    fatal("Large Loader export directory symbol has been replaced");
+  replaceSymbol<DefinedSynthetic>(exportDirectorySymbol, exportDirectorySymbol->getName(), exportDirectoryChunk);
+
+  // Append all chunks to the final chunk list
+  chunks.push_back(exportDirectoryChunk);
+  chunks.insert(chunks.end(), exportRVATableChunks.begin(), exportRVATableChunks.end());
+  chunks.insert(chunks.end(), exportHashBucketTableChunks.begin(), exportHashBucketTableChunks.end());
+  chunks.insert(chunks.end(), exportTableChunks.begin(), exportTableChunks.end());
+  chunks.insert(chunks.end(), exportAuxRVATableChunks.begin(), exportAuxRVATableChunks.end());
 }
+
+Chunk *LargeLoaderExportDataContents::findOrCreateNameChunk(StringRef name) {
+  if (const auto iterator = nameChunkLookup.find(name); iterator != nameChunkLookup.end()) {
+    return iterator->second;
+  }
+  Chunk *newNameChunk = make<StringChunk>(name);
+  nameChunks.push_back(newNameChunk);
+  nameChunkLookup.insert({name, newNameChunk});
+  return newNameChunk;
+}
+
 // </COFF_LARGE_EXPORTS>
 
 std::vector<Chunk *> DelayLoadContents::getChunks() {
@@ -1607,31 +1812,6 @@ Chunk *DelayLoadContents::newThunkChunk(DefinedImportData *s,
 }
 
 void createEdataChunks(SymbolTable &symtab, std::vector<Chunk *> &chunks) {
-  // <COFF_LARGE_EXPORTS> When building large exports, we only want to emit a single normal export, which points to the start of the large loader exports section
-  if (ctx.config.largeExports && !ctx.config.exports.empty()) {
-
-    Chunk *dllNameChunk = make<StringChunk>(sys::path::filename(ctx.config.outputFile));
-    Chunk *exportedSymbolNameChunk = make<StringChunk>("__large_loader_exports_base");
-    Symbol *exportSectionBaseSymbol = ctx.symtab.find("__large_loader_exports_base"); // this will be created as undefined on the start by the Driver, and then later replaced
-    if (exportSectionBaseSymbol == nullptr)
-      fatal("Failed to find large loader exports base symbol. It should have been added by the Driver");
-
-    Chunk *addressTab = make<SymbolRVAChunk>(ctx, exportSectionBaseSymbol); // symbol will be replaced with DefinedSynthetic when large export tables are created
-    Chunk *ordinalTab = make<NullChunk>(sizeof(uint16_t)); // since we only have a single export, it's unbiased ordinal is always 0, written as uint16_t
-    std::vector<Chunk *> exportNames = {exportedSymbolNameChunk};
-    Chunk *nameTab = make<NamePointersChunk>(exportNames); // only have a single name for a single export
-    Chunk *dir = make<ExportDirectoryChunk>(1, 1, 1, dllNameChunk, addressTab, nameTab, ordinalTab); // base ordinal is 1, max ordinal is 1, name count is 1
-
-    chunks.push_back(dir);
-    chunks.push_back(dllNameChunk);
-    chunks.push_back(addressTab);
-    chunks.push_back(nameTab);
-    chunks.push_back(ordinalTab);
-    chunks.push_back(exportedSymbolNameChunk);
-    return;
-  }
-  // </COFF_LARGE_EXPORTS>
-
   unsigned baseOrdinal = 1 << 16, maxOrdinal = 0;
   for (Export &e : symtab.exports) {
     baseOrdinal = std::min(baseOrdinal, (unsigned)e.ordinal);

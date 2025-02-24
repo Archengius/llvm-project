@@ -656,45 +656,6 @@ err:
   llvm_unreachable("");
 }
 
-// <COFF_LARGE_EXPORTS>
-void LinkerDriver::validateLargeExports() {
-  bool exportValidationFailed = false;
-
-  for (Export &e : ctx.config.exports) {
-
-    // Unnamed/ordinal-only exports are not supported in large exports mode
-    if (e.noname) {
-      exportValidationFailed = false;
-      error("Found unnamed DLL Export " + e.name + " with ordinal " + std::to_string(e.ordinal) + ". Unnamed exports are not supported in Large Exports mode.");
-    }
-    // Large exports do not support forwarding
-    if (!e.forwardTo.empty()) {
-      exportValidationFailed = true;
-      error("DLL Export Forwarding is not supported in Large Exports mode. Tried to forward " + e.name + " to " + e.forwardTo);
-    }
-    // Large exports do not support MiNGW alternate imports
-    if (!e.importName.empty()) {
-      exportValidationFailed = false;
-      error("DLL GNU/MinGW like alternate imports are not supported in Large Exports mode. Tried to alias export " + e.name + " to " + e.importName);
-    }
-    // EXPORTAS is not supported in Large Exports mode. We can support this later for ARM64EC if we decide to implement the platform support for it
-    if (!e.exportAs.empty()) {
-      exportValidationFailed = false;
-      error("Aliased (EXPORTAS) exports are not supported in Large Exports mode. Tried to alias export " + e.name + " as " + e.exportAs);
-    }
-
-    // Large exports do not use ordinals, so warn when the explicit ordinals are specified for large exports
-    if (e.ordinal != 0)
-      warn("Explicit ordinal was specified for an export " + e.name + ". Large Exports do not use ordinals, so the explicit ordinal value will be ignored.");
-  }
-
-  // Abort immediately if we found any unsupported exports
-  if (exportValidationFailed) {
-    fatal("Failed to validate exports for output file");
-  }
-}
-// </COFF_LARGE_EXPORTS>
-
 // Parses a string in the form of "key=value" and check
 // if value matches previous values for the same key.
 void LinkerDriver::checkFailIfMismatch(StringRef arg, InputFile *source) {

@@ -214,8 +214,9 @@ private:
   void createImportTables();
   void appendImportThunks();
   // <COFF_LARGE_EXPORTS>
-  void createLargeImportTables();
-  void createLargeExportTables();
+  void setupLargeLoaderDependencies();
+  void createLargeLoaderImportTable();
+  void createLargeLoaderExportTable();
   // </COFF_LARGE_EXPORTS>
   void locateImportTables();
   void createExportTable();
@@ -264,8 +265,7 @@ private:
   void sortCRTSectionChunks(std::vector<Chunk *> &chunks);
   void addSyntheticIdata();
   // <COFF_LARGE_EXPORTS>
-  void addSyntheticLargeEdata();
-  void addSyntheticLargeIdata();
+  void addSyntheticLargeLoaderCode();
   // </COFF_LARGE_EXPORTS>
   void sortBySectionOrder(std::vector<Chunk *> &chunks);
   void fixPartialSectionChars(StringRef name, uint32_t chars);
@@ -295,8 +295,8 @@ private:
   std::vector<ECCodeMapEntry> codeMap;
   IdataContents idata;
   // <COFF_LARGE_EXPORTS>
-  LargeIdataContents lidata;
-  LargeEdataContents *ledata{};
+  LargeLoaderImportDataContents largeImportsData;
+  LargeLoaderExportDataContents largeExportsData;
   // </COFF_LARGE_EXPORTS>
   Chunk *importTableStart = nullptr;
   uint64_t importTableSize = 0;
@@ -340,6 +340,10 @@ private:
   OutputSection *dtorsSec;
   // Either .rdata section or .buildid section.
   OutputSection *debugInfoSec;
+  // <COFF_LARGE_EXPORTS>
+  OutputSection *largeIdataSec;
+  OutputSection *largeEdataSec;
+  // </COFF_LARGE_EXPORTS>
 
   // The range of .pdata sections in the output file.
   //
@@ -781,16 +785,22 @@ void Writer::run() {
     calculateStubDependentSizes();
     if (ctx.config.machine == ARM64X)
       ctx.dynamicRelocs = make<DynamicRelocsChunk>();
-    // <COFF_LARGE_EXPORTS> Create tables before creation of import tables, since we will append large loader import and one import per large loaded DLL to it
-    createLargeExportTables();
-    createLargeImportTables();
+    // <COFF_LARGE_EXPORTS>
+    setupLargeLoaderDependencies();
     // </COFF_LARGE_EXPORTS>
     createImportTables();
     createSections();
+    // <COFF_LARGE_EXPORTS>
+    // Large loader import table must be created before Control Flow guard tables are added, since it appends import thunks to the code section
+    createLargeLoaderImportTable();
+    // </COFF_LARGE_EXPORTS>
     appendImportThunks();
     // Import thunks must be added before the Control Flow Guard tables are
     // added.
     createMiscChunks();
+    // <COFF_LARGE_EXPORTS>
+    createLargeLoaderExportTable();
+    // </COFF_LARGE_EXPORTS>
     createExportTable();
     mergeSections();
     sortECChunks();
@@ -962,38 +972,13 @@ void Writer::addSyntheticIdata() {
 }
 
 // <COFF_LARGE_EXPORTS>
-void Writer::addSyntheticLargeEdata() {
+void Writer::addSyntheticLargeLoaderCode() {
   uint32_t rdata = IMAGE_SCN_CNT_INITIALIZED_DATA | IMAGE_SCN_MEM_READ;
-  StringRef partialSectionName = ctx.saver.save(".ledata$1");
-
-  // Populate the section with the chunks from the contents
-  PartialSection *pSection = createPartialSection(partialSectionName, rdata);
-  pSection->chunks.push_back(ledata->sectionHeaderChunk);
-  pSection->chunks.insert(pSection->chunks.end(), ledata->exportRVATableChunks.begin(), ledata->exportRVATableChunks.end());
-  pSection->chunks.insert(pSection->chunks.end(), ledata->exportHashBucketTableChunks.begin(), ledata->exportHashBucketTableChunks.end());
-  pSection->chunks.insert(pSection->chunks.end(), ledata->exportTableChunks.begin(), ledata->exportTableChunks.end());
-  pSection->chunks.insert(pSection->chunks.end(), ledata->nameChunks.begin(), ledata->nameChunks.end());
-}
-
-void Writer::addSyntheticLargeIdata() {
-  uint32_t rdata = IMAGE_SCN_CNT_INITIALIZED_DATA | IMAGE_SCN_MEM_READ;
-
-  // This function will also run if we have large exports but no imports, so guard this code
-  if (!lidata.empty()) {
-    PartialSection *pSection = createPartialSection(ctx.saver.save(".lidata$1"), rdata);
-
-    // Write section chunks in natural order
-    pSection->chunks.push_back(lidata.sectionHeaderChunk);
-    pSection->chunks.insert(pSection->chunks.end(), lidata.addressTableChunks.begin(), lidata.addressTableChunks.end());
-    pSection->chunks.insert(pSection->chunks.end(), lidata.importedExportSectionChunks.begin(), lidata.importedExportSectionChunks.end());
-    pSection->chunks.insert(pSection->chunks.end(), lidata.importChunks.begin(), lidata.importChunks.end());
-    pSection->chunks.insert(pSection->chunks.end(), lidata.nameChunks.begin(), lidata.nameChunks.end());
-  }
 
   // We need to have static initializers run to link the large imports with the loader DLL. If we are not linked to CRT, the initializers will not be ran,
   // and as such, the loading will not work. We could support allow this case to be manually handled as long as the initializer is manually called, but for now we do not allow it
   if (findPartialSection(".CRT$XCA", rdata) == nullptr || findPartialSection(".CRT$XTA", rdata) == nullptr)
-    fatal("Failed to find .CRT$XCA section in the executable. That means the executable was not linked with the CRT library. This case is not supported by Large Linker yet.");
+    Fatal(ctx) << "Failed to find .CRT$XCA section in the executable. That means the executable was not linked with the CRT library. This case is not supported by Large Linker yet.";
 
   auto* initializerSection = createPartialSection(".CRT$XCB", rdata);
   auto* terminatorSection = createPartialSection(".CRT$XTB", rdata);
@@ -1001,15 +986,16 @@ void Writer::addSyntheticLargeIdata() {
   // Print warnings for any symbols that are defined in the XCB section since they will run before the large linker
   for (Chunk *chunk : initializerSection->chunks) {
     if (SectionChunk* sectionChunk = dyn_cast<SectionChunk>(chunk))
-      warn("Found static C++ initializer running as a part of the .CRT$XCB section: "
-        + sectionChunk->getDebugName() + ". This code will run before the large linker, and will not be able to use any of its imports. Proceed with caution");
+      Warn(ctx) << "Found static C++ initializer running as a part of the .CRT$XCB section: "
+        << sectionChunk->getDebugName() << ". This code will run before the large linker, and will not be able to use any of its imports. Proceed with caution";
   }
 
-  // Append the generated text chunks to text section
-  textSec->chunks.insert(textSec->chunks.end(), lidata.textChunks.begin(), lidata.textChunks.end());
-  // Add the initializers into the initializer list
-  initializerSection->chunks.insert(initializerSection->chunks.end(), lidata.initializerChunks.begin(), lidata.initializerChunks.end());
-  terminatorSection->chunks.insert(terminatorSection->chunks.end(), lidata.terminatorChunks.begin(), lidata.terminatorChunks.end());
+  // Append the generated text chunks to text section. These will be sorted based on the architecture as well
+  textSec->chunks.insert(textSec->chunks.end(), largeImportsData.textChunks.begin(), largeImportsData.textChunks.end());
+
+  // Add the initializers into the initializer list. These will be sorted based on machine architecture later
+  initializerSection->chunks.insert(initializerSection->chunks.end(), largeImportsData.initializerChunks.begin(), largeImportsData.initializerChunks.end());
+  terminatorSection->chunks.insert(terminatorSection->chunks.end(), largeImportsData.terminatorChunks.begin(), largeImportsData.terminatorChunks.end());
 }
 // </COFF_LARGE_EXPORTS>
 
@@ -1152,6 +1138,10 @@ void Writer::createSections() {
   pdataSec = createSection(".pdata", data | r);
   idataSec = createSection(".idata", data | r);
   edataSec = createSection(".edata", data | r);
+  // <COFF_LARGE_EXPORTS>
+  largeIdataSec = createSection(".lidata", data | r);
+  largeEdataSec = createSection(".ledata", data | r);
+  // </COFF_LARGE_EXPORTS>
   didatSec = createSection(".didat", data | r);
   if (isArm64EC(ctx.config.machine))
     a64xrmSec = createSection(".a64xrm", data | r);
@@ -1191,12 +1181,7 @@ void Writer::createSections() {
   if (hasIdata)
     addSyntheticIdata();
   // <COFF_LARGE_EXPORTS>
-  // Create large exports data section if we are generating large exports
-  if (ledata != nullptr)
-    addSyntheticLargeEdata();
-  // Create large imports data section if there are any large imports still alive, or we need exports to be registered
-  if (!lidata.empty() || ledata != nullptr)
-    addSyntheticLargeIdata();
+  addSyntheticLargeLoaderCode();
   // </COFF_LARGE_EXPORTS>
 
   sortSections();
@@ -1450,7 +1435,13 @@ void Writer::createExportTable() {
         Warn(ctx) << "literal .edata sections override exports";
     } else if (!symtab.exports.empty()) {
       std::vector<Chunk *> edataChunks;
-      createEdataChunks(symtab, edataChunks);
+      // <COFF_LARGE_EXPORTS>
+      // Create stub edata chunks for the large loader when we are building large export data
+      if (ctx.config.largeExports)
+        largeExportsData.createStubEdataChunksForLargeLoader(symtab, edataChunks);
+      else
+        createEdataChunks(symtab, edataChunks);
+      // </COFF_LARGE_EXPORTS>
       for (Chunk *c : edataChunks)
         edataSec->addChunk(c);
       symtab.edataStart = edataChunks.front();
@@ -1465,19 +1456,27 @@ void Writer::createExportTable() {
 }
 
 // <COFF_LARGE_EXPORTS>
-void Writer::createLargeImportTables() {
-  llvm::TimeTraceScope timeScope("Large import tables");
+void Writer::setupLargeLoaderDependencies() {
+  int largeLoderMaxLoadOrder = ctx.config.dllOrder.size();
+  bool largeLoaderDllReferenced = false;
 
-  std::set<StringRef> allDllNamesSet;
-  int lowestLargeDllLoadOrderVal = ctx.config.dllOrder.size();
+  ctx.forEachSymtab([&](SymbolTable &symtab) {
+    std::set<StringRef> allDllNamesSet;
+    int lowestLargeLoaderImportedDllLoadOrder = ctx.config.dllOrder.size();
+    bool hasLargeLoaderImports = false;
 
-  // Collect all import symbols that have not been reference eliminated, and all the referenced DLLs
-  for (LargeImportFile *file : ctx.largeImportFileInstances) {
-    if (!file->live)
-      continue;
+    // Collect live imports that match the architecture of this symtab
+    for (LargeImportData *file : ctx.largeImportFileInstances) {
+      if (!file->isLive())
+        continue;
+      // This check could be incorrect for non-ARM64EC hybrid binaries, but such binaries do not exist presently
+      if (file->isEC() != symtab.isEC())
+        continue;
+      hasLargeLoaderImports = true;
 
-    // Initialize DLLOrder for the DLL filename hint if it is present in the import
-    if (!file->dllName.empty()) {
+      // We are only interested in non-wildcard imports
+      if (file->dllName.empty())
+        continue;
       std::string lowercaseDll = StringRef(file->dllName).lower();
 
       // Collect all referenced DLL names to create import entries for them
@@ -1487,66 +1486,97 @@ void Writer::createLargeImportTables() {
         // Add the loading order entry for this DLL if it does not exist already
         ctx.config.dllOrder[lowercaseDll] = ctx.config.dllOrder.size();
       } else {
-        // Otherwise remember the loading order value of this DLL. We must insert large loader
-        lowestLargeDllLoadOrderVal = std::min(lowestLargeDllLoadOrderVal, ctx.config.dllOrder[lowercaseDll]);
+        // Otherwise remember the loading order value of this DLL. We must load large loader before any Large Loader-required DLLs to support cyclic DLL dependencies correctly
+        lowestLargeLoaderImportedDllLoadOrder = std::min(lowestLargeLoaderImportedDllLoadOrder, ctx.config.dllOrder[lowercaseDll]);
       }
-
       // Make sure large export-enabled DLLs are not delay loaded, since the linker implementation we have does not support that
       if (ctx.config.delayLoads.count(lowercaseDll))
-        fatal("cannot delay-load " + toString(file) + " due to delay-loading not being supported for Large Exports");
+        Fatal(ctx) << "cannot delay-load " << file->dllName << " due to delay-loading not being supported for Large Loader";
     }
-    lidata.add(file->impSym);
-  }
-  // Append all synthetic large imports that have not been replaced. They do not reference any DLLs themselves.
-  for ( Symbol* sym : ctx.symtab.syntheticLargeImportSymbols ) {
-    if (!isa<DefinedLargeImportSynthetic>(sym))
-      continue;
-    lidata.add(cast<DefinedLargeImportSynthetic>(sym));
-  }
 
-  // If we have any large imports, or any exports, add the loader dependency
-  if (!lidata.empty() || ledata != nullptr) {
-    lidata.createLoaderImports(ctx, lowestLargeDllLoadOrderVal - 1);
-  }
+    // Create import directory initializer if we have any large imports
+    if (hasLargeLoaderImports) {
+      largeLoderMaxLoadOrder = std::min(largeLoderMaxLoadOrder, lowestLargeLoaderImportedDllLoadOrder);
+      largeLoaderDllReferenced = true;
+      largeImportsData.setupLargeLoaderImportDirectoryInitializer(symtab);
 
-  // If we have any large imports still alive, build the section
-  if (!lidata.empty()) {
-
-    // Sort DLL synthetic imports in DLL load order
-    std::vector<StringRef> sortedDllNames{allDllNamesSet.begin(), allDllNamesSet.end()};
-    stable_sort(sortedDllNames, [&](const StringRef& dllNameA, const StringRef& dllNameB) {
-      std::string dllNameLowercaseA = dllNameA.lower();
-      std::string dllNameLowercaseB = dllNameB.lower();
-
-      // Sort by the loading order. Entries with lower loading order go first
-      return ctx.config.dllOrder[dllNameLowercaseA] < ctx.config.dllOrder[dllNameLowercaseB];
-    });
-
-    // Create synthetic large loader imports for these DLLs
-    for (const StringRef& dllName : sortedDllNames) {
-      lidata.createLargeLoaderDllImport(ctx, dllName);
+      // Also set up large loader imported DLL dependencies, we need them before import tables are initialized
+      largeImportsData.setupLargeLoaderDllImportDependencies(symtab, allDllNamesSet);
     }
-    // Build section contents now
-    lidata.buildSectionContents(ctx);
-    // Create link initializer chunk now that we built a section header
-    lidata.createLinkInitializerChunk(ctx);
-  }
 
-  // Create exports initializer/terminator chunks if we have any exports
-  if (ledata != nullptr) {
-    lidata.exportsSectionHeaderChunk = ledata->sectionHeaderChunk;
-    lidata.createRegisterInitializerChunk(ctx);
-    lidata.createUnregisterTerminatorChunk(ctx);
+    // Create export directory initializer if we have large exports
+    if (symtab.ctx.config.largeExports && !symtab.exports.empty()) {
+      largeLoaderDllReferenced = true;
+      largeImportsData.setupLargeLoaderExportDirectoryInitializer(symtab);
+    }
+  });
+
+  // If we referenced large loader DLL from any symtab exports or imports, set up a load order entry for it
+  if (largeLoaderDllReferenced) {
+    largeImportsData.setupLargeLoaderDllOrder(ctx, largeLoderMaxLoadOrder);
   }
 }
 
-void Writer::createLargeExportTables() {
-  llvm::TimeTraceScope timeScope("Large export tables");
+void Writer::createLargeLoaderImportTable() {
+  llvm::TimeTraceScope timeScope("Large Loader import table");
 
-  // Only create large export tables if we are asked to produce large export compatible binary, and we actually have exports
-  if (ctx.config.largeExports && !ctx.config.exports.empty()) {
-    ledata = make<LargeEdataContents>(ctx);
-  }
+  ctx.forEachSymtab([&](SymbolTable &symtab) {
+
+    std::vector<LargeImportData *> liveLargeImports;
+
+    // Collect all import symbols that have not been reference eliminated, and all the referenced DLLs
+    for (LargeImportData *file : ctx.largeImportFileInstances) {
+      if (!file->isLive())
+        continue;
+      // This check could be incorrect for non-ARM64EC hybrid binaries, but such binaries do not exist presently
+      if (file->isEC() != symtab.isEC())
+        continue;
+      liveLargeImports.push_back(file);
+    }
+
+    // Append all thunks created by the import file to the text section if they are still alive
+    for (LargeImportData *file : liveLargeImports) {
+      if (file->thunkSym && file->thunkSym->isLive()) {
+        if (!isa<DefinedLargeImportThunk>(file->thunkSym))
+          Fatal(ctx) << "Large Loader Import thunk symbol " << file->thunkSym << " has been replaced";
+        textSec->addChunk(file->thunkSym->getChunk());
+      }
+      if (file->auxThunkSym && file->auxThunkSym->isLive()) {
+        if (!isa<DefinedLargeImportThunk>(file->auxThunkSym))
+          Fatal(ctx) << "Large Loader Auxiliary Import thunk symbol " << file->auxThunkSym << " has been replaced";
+        textSec->addChunk(file->auxThunkSym->getChunk());
+      }
+      if (file->impchkThunk && file->impchkThunk->sym->isLive()) {
+       if (!isa<DefinedLargeImportThunk>(file->impchkThunk->sym))
+         Fatal(ctx) << "Large Loader Import Check thunk symbol " << file->impchkThunk->sym << " has been replaced";
+       textSec->addChunk(file->impchkThunk);
+      }
+    }
+
+    // Create large idata chunks from all the imports we have collected
+    if (!liveLargeImports.empty()) {
+      std::vector<Chunk *> idataChunks;
+      largeImportsData.createLargeIdataChunks(symtab, liveLargeImports, idataChunks);
+      largeIdataSec->chunks.insert(largeIdataSec->chunks.end(), idataChunks.begin(), idataChunks.end());
+    }
+  });
+  // Append name chunks to the large idata section end
+  largeIdataSec->chunks.insert(largeIdataSec->chunks.end(), largeImportsData.nameChunks.begin(), largeImportsData.nameChunks.end());
+}
+
+void Writer::createLargeLoaderExportTable() {
+  llvm::TimeTraceScope timeScope("Large Loader export table");
+
+  ctx.forEachSymtab([&](SymbolTable &symtab) {
+    // Only create large export tables if we are asked to produce large export compatible binary, and we actually have exports
+    if (ctx.config.largeExports && !symtab.exports.empty()) {
+      std::vector<Chunk *> edataChunks;
+      largeExportsData.createLargeEdataChunks(symtab, edataChunks);
+      largeEdataSec->chunks.insert(largeEdataSec->chunks.end(), edataChunks.begin(), edataChunks.end());
+    }
+  });
+  // Append name chunks to the large edata section end
+  largeEdataSec->chunks.insert(largeEdataSec->chunks.end(), largeExportsData.nameChunks.begin(), largeExportsData.nameChunks.end());
 }
 // </COFF_LARGE_EXPORTS>
 
@@ -2185,8 +2215,7 @@ static void maybeAddAddressTakenFunction(SymbolRVASet &addressTakenSyms,
     // symbols shouldn't have relocations.
     break;
   // <COFF_LARGE_EXPORTS>
-  case Symbol::DefinedLargeImportDataKind:
-  case Symbol::DefinedLargeImportSyntheticKind:
+  case Symbol::DefinedLargeImportKind:
     break;
   case Symbol::DefinedLargeImportThunkKind:
     addSymbolToRVASet(addressTakenSyms, cast<Defined>(s));

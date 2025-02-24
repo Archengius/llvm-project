@@ -67,7 +67,6 @@ class Undefined;
 class TpiSource;
 // <COFF_LARGE_EXPORTS>
 class DefinedLargeImport;
-class DefinedLargeImportData;
 class DefinedLargeImportThunk;
 // </COFF_LARGE_EXPORTS>
 
@@ -396,41 +395,95 @@ public:
 };
 
 // <COFF_LARGE_EXPORTS>
+
 // This type represents Large Import definition that maps to a specific symbol name
 // without an ordinal, and with an optional file association
 // DLL association is only used to speed up the symbol lookups, but is used as a hint rather than a rule,
 // compared to traditional PE import/export tables.
-class LargeImportFile : public InputFile {
+class LargeImportData {
 public:
-  explicit LargeImportFile(COFFLinkerContext &ctx, MemoryBufferRef m);
+  enum LargeImportDataKind {
+    LargeImportFileKind,
+    SyntheticLargeImportDataKind,
+  };
+  explicit LargeImportData(LargeImportDataKind dataKind) : dataKind(dataKind) {}
 
-  static bool classof(const InputFile *f) { return f->kind() == LargeImportKind; }
-  MachineTypes getMachineType() const override;
+  LargeImportDataKind largeImportDataKind() const { return dataKind; }
+  bool isEC() const { return impECSym != nullptr; }
+
+  virtual MachineTypes getMachineType() const = 0;
+  virtual SymbolTable &getSymbtab() const = 0;
+  virtual InputFile *getFile() { return nullptr; }
+  virtual bool isLive() const { return true; }
+  virtual void markLive() {}
+protected:
+  void createImportSymbols();
 private:
-  void parse() override;
   ImportThunkChunk *makeImportThunk();
 
+  // Kind of this large import data
+  LargeImportDataKind dataKind;
 public:
-  // Name of the symbol, without the __imp_ prefix appended for the import symbols
+  // Internal name of the symbol, without the __imp_ prefix appended
+  StringRef internalName;
+  // External name of the symbol, e.g. the name of the export in the DLL
   StringRef externalName;
   // Type of this import
-  uint8_t importType;
+  uint8_t importType{};
   // Flags set on this import
-  uint8_t importFlags;
+  uint8_t importFlags{};
   // Name of the DLL/PE file that this symbol comes from. Empty means a wildcard import, e.g. look up this import in all loaded DLLs
   StringRef dllName;
   // If this import is considered live, and is included into the large import section, this will be a chunk that contains the value of this data symbol
   Chunk *location = nullptr;
+  // Auxiliary IAT symbol chunk for ARM64EC
+  Chunk *auxLocation = nullptr;
 
   // Import symbol for data members and function pointers
-  DefinedLargeImportData *impSym = nullptr;
+  DefinedLargeImport *impSym = nullptr;
+  // Auxiliary IAT symbol for ARM64EC
+  DefinedLargeImport *impECSym = nullptr;
   // Import symbol for function thunks for code that is unaware of the fact that the member is imported and not defined locally
   Defined *thunkSym = nullptr;
+  // Auxiliary IAT function thunk for ARM64EC
+  Defined *auxThunkSym = nullptr;
+  // Fallback thunk if auxiliary IAT slot for this import is not populated by the loader. Will enter X64 emulator and call into X64 code in the main IAT slot
+  ImportThunkChunkARM64EC *impchkThunk = nullptr;
+};
+
+// Large Import Data that has been parsed from the Short Large Import Object File
+class LargeImportFile : public InputFile, public LargeImportData {
+public:
+  explicit LargeImportFile(COFFLinkerContext &ctx, MemoryBufferRef m);
+
+  static bool classof(const InputFile *f) { return f->kind() == LargeImportKind; }
+  static bool classof(const LargeImportData *d) { return d->largeImportDataKind() == LargeImportFileKind; }
+
+  static MachineTypes getMachineType(MemoryBufferRef m);
+  MachineTypes getMachineType() const override { return getMachineType(mb); }
+  SymbolTable &getSymbtab() const override { return symtab; }
+  InputFile *getFile() override { return this; }
+  bool isLive() const override { return live; }
+  void markLive() override { live = true; }
+private:
+  void parse() override;
 
   // True if this file has been referenced by any symbols. This is set by MarkWrite
   // to eliminate large imports that are not actually referenced, which is important since large imports
   // usually imply an extremely large number of exports that would take a lot of time to dynamically link
-  bool live;
+  bool live{};
+};
+
+// Synthetic large import data created when using auto imports
+class SyntheticLargeImportData : public LargeImportData {
+public:
+  explicit SyntheticLargeImportData(SymbolTable &symtab, StringRef externalName);
+
+  static bool classof(const LargeImportData *d) { return d->largeImportDataKind() == SyntheticLargeImportDataKind; }
+  MachineTypes getMachineType() const override;
+  SymbolTable &getSymbtab() const override { return symtab; }
+private:
+  SymbolTable &symtab;
 };
 // </COFF_LARGE_EXPORTS>
 

@@ -1274,63 +1274,131 @@ BitcodeFile::BitcodeFile(SymbolTable &symtab, MemoryBufferRef mb,
 }
 
 // <COFF_LARGE_EXPORTS>
-LargeImportFile::LargeImportFile(COFFLinkerContext &ctx, MemoryBufferRef m) : InputFile(ctx, LargeImportKind, m), live(!ctx.config.doGC) {
+void LargeImportData::createImportSymbols() {
+  SymbolTable &symtab = getSymbtab();
+
+  // If this is an ARM64EC import library, and external name is a mangled ARM64EC name, de-mangle it first before using it as a base local symbol name
+  StringRef internalNameBase = internalName;
+  if (symtab.isEC()) {
+    if (std::optional<std::string> demangledName = getArm64ECDemangledFunctionName(internalNameBase))
+      internalNameBase = saver().save(*demangledName);
+  }
+
+  // create import symbol IAT chunk for this symbol. On ARM64EC, we need to create two symbols, one for main IAT and one for auxiliary IAT
+  StringRef importName = saver().save("__imp_" + internalNameBase);
+  if (!symtab.isEC()) {
+    impSym = symtab.addLargeImport(importName, this, location);
+  } else {
+    // For ARM64EC code imports, we need to create two import symbols. __imp_ symbol always points to native ARM64EC code in auxiliary IAT, while __imp_aux_ symbol points to x64 code in main IAT.
+    // For data symbols both generally point to the exact same RVA, both X64 and ARM64EC object files point to __imp symbol in main IAT, and __imp_aux_ is never used.
+    // Note that while main IAT usually points to X64 code (or X64 thunk), it is possible for it to potentially point to raw native ARM64EC code, even though this case is slower as it requires the emulator to look up page mappings
+    StringRef auxImportName = saver().save("__imp_aux_" + internalNameBase);
+
+    // Treat wildcard imports as code imports on ARM64EC. For data, it does not make a difference whenever it references auxiliary IAT or main IAT
+    if (importType == LARGE_LOADER_IMPORT_TYPE_CODE || importType == LARGE_LOADER_IMPORT_TYPE_WILDCARD) {
+      impSym = symtab.addLargeImport(auxImportName, this, location);
+      // Mark EC import symbol as auxiliary IAT code chunk
+      impECSym = symtab.addLargeImport(importName, this, auxLocation, true);
+    } else {
+      impSym = symtab.addLargeImport(importName, this, location);
+      impECSym = symtab.addLargeImport(auxImportName, this, auxLocation);
+    }
+  }
+
+  // Create the thunk that can be called directly by the code that is unaware of the fact that this is an import, if this import represents a function
+  // Note that because the external code is unaware that it is an import, the name of the function is not prefixed with the __imp_ prefix, and directly represents the external name
+  // Conservatively treat wildcard imports as code imports on ARM64EC, since we have to generate impchkThunk for them to function correctly if they turn out to be code
+  if (importType == LARGE_LOADER_IMPORT_TYPE_CODE || (symtab.isEC() && importType == LARGE_LOADER_IMPORT_TYPE_WILDCARD)) {
+    if (!symtab.isEC()) {
+      thunkSym = symtab.addLargeImportThunk(internalNameBase, impSym, makeImportThunk());
+    } else {
+      // Create a X64 thunk that just transfers the control to the x64 code in main IAT. This can be called by X64 code
+      thunkSym = symtab.addLargeImportThunk(internalNameBase, impSym, make<ImportThunkChunkX64>(symtab.ctx, impSym));
+
+      // Create an ARM64EC thunk that just transfers control to the native ARM64EC code in auxiliary IAT. This can be called by ARM64EC code
+      if (std::optional<std::string> mangledName = getArm64ECMangledFunctionName(internalNameBase)) {
+        StringRef auxThunkName = saver().save(*mangledName);
+        auxThunkSym = symtab.addLargeImportThunk(auxThunkName, impECSym, make<ImportThunkChunkARM64>(symtab.ctx, impECSym, ARM64EC));
+      }
+
+      // __impchk_ in a synthetic thunk used as a fallback when a native ARM64EC import cannot be satisfied because only X64 export is available
+      // In that case, auxiliary IAT will point to this thunk, which will enter the X64 emulator and call the X64 import from the main IAT
+      StringRef impChkName = saver().save("__impchk_" + internalNameBase);
+      impchkThunk = make<ImportThunkChunkARM64EC>(symtab, impSym);
+      impchkThunk->sym = symtab.addLargeImportThunk(impChkName, impSym, impchkThunk);
+      symtab.ctx.driver.pullArm64ECIcallHelper();
+    }
+  }
 }
 
-MachineTypes LargeImportFile::getMachineType() const {
-  uint16_t Machine = reinterpret_cast<const COFFLargeImportHeader *>(mb.getBufferStart())->Machine;
+ImportThunkChunk *LargeImportData::makeImportThunk() {
+  switch (getMachineType()) {
+  case AMD64:
+    return make<ImportThunkChunkX64>(getSymbtab().ctx, impSym);
+  case I386:
+    return make<ImportThunkChunkX86>(getSymbtab().ctx, impSym);
+  case ARM64:
+    return make<ImportThunkChunkARM64>(getSymbtab().ctx, impSym, ARM64);
+  case ARMNT:
+    return make<ImportThunkChunkARM>(getSymbtab().ctx, impSym);
+  }
+  llvm_unreachable("unknown machine type");
+}
+
+LargeImportFile::LargeImportFile(COFFLinkerContext &ctx, MemoryBufferRef m) :
+  InputFile(ctx.getSymtab(getMachineType(m)), LargeImportKind, m),
+  LargeImportData(LargeImportFileKind), live(!ctx.config.doGC) {
+}
+
+MachineTypes LargeImportFile::getMachineType(MemoryBufferRef m) {
+  uint16_t Machine = reinterpret_cast<const COFFLargeImportHeader *>(m.getBufferStart())->Machine;
   return MachineTypes(Machine);
 }
 
 void LargeImportFile::parse() {
   // Make sure we have enough data to read the header
   if (mb.getBufferSize() < sizeof(COFFLargeImportHeader))
-    fatal("Received corrupted large import file with size smaller than the large import header");
+    Fatal(symtab.ctx) << "Received corrupted large import file with size smaller than the large import header";
 
   const auto *header = reinterpret_cast<const COFFLargeImportHeader *>(mb.getBufferStart());
 
   // Make sure the version of the header file is supported
   if (header->Version != 1)
-    fatal("Received large import file with unknown version number " + std::to_string(header->Version) + ". Latest version supported by this linker is 1.");
+    Fatal(symtab.ctx) << "Received large import file with unknown version number " << std::to_string(header->Version) << ". Latest version supported by this linker is 1.";
 
   // Make sure the data is not corrupted. We should have at least enough data to cover DLL name, header and export name. Additional metadata after the import is permitted.
-  if (mb.getBufferSize() < (sizeof(COFFLargeImportHeader) + header->SizeOfSymbolName + header->SizeOfDllNameHint))
-    fatal("Received corrupted large import file with size smaller than the calculated import payload size");
+  if (mb.getBufferSize() < (sizeof(COFFLargeImportHeader) + header->SizeOfInternalSymbolName + header->SizeOfDllNameHint))
+    Fatal(symtab.ctx) << "Received corrupted large import file with size smaller than the calculated import payload size";
 
+  // Read the data from the import file
   importType = header->Type;
   importFlags = header->Flags;
-  externalName = mb.getBuffer().substr(sizeof(COFFLargeImportHeader), header->SizeOfSymbolName);
-  dllName = mb.getBuffer().substr(sizeof(COFFLargeImportHeader) + header->SizeOfSymbolName, header->SizeOfDllNameHint);
+  internalName = mb.getBuffer().substr(sizeof(COFFLargeImportHeader), header->SizeOfInternalSymbolName);
+  dllName = mb.getBuffer().substr(sizeof(COFFLargeImportHeader) + header->SizeOfInternalSymbolName, header->SizeOfDllNameHint);
 
-  // Make sure machine type matches the machine type we are linking for
-  uint16_t libMachineType = header->Machine;
-  if (header->Machine != ctx.config.machine)
-    fatal("Attempting to link against a large import file " + externalName + " built for machine type " + machineToStr((MachineTypes)libMachineType) + " while linking a target for machine type " + machineToStr(ctx.config.machine));
+  // If we have an external name explicitly given, read it from the buffer
+  if (header->SizeOfExternalSymbolName)
+    externalName = mb.getBuffer().substr(sizeof(COFFLargeImportHeader) + header->SizeOfInternalSymbolName + header->SizeOfDllNameHint, header->SizeOfExternalSymbolName);
+  else
+    // By default, external name matches the internal name
+    externalName = internalName;
 
-  StringRef importName = saver().save("__imp_" + externalName);
-  impSym = ctx.symtab.addLargeImportData(importName, this);
-
-  // Create the thunk that can be called directly by the code that is unaware of the fact that this is an import, if this import represents a function
-  // Note that because the external code is unaware that it is an import, the name of the function is not prefixed with the __imp_ prefix, and directly represents the external name
-  if (header->Type == LARGE_LOADER_IMPORT_TYPE_CODE) {
-    thunkSym = ctx.symtab.addLargeImportThunk(externalName, impSym, makeImportThunk());
-  }
+  // Initialize the symbols for the import
+  createImportSymbols();
 }
 
-ImportThunkChunk *LargeImportFile::makeImportThunk() {
-  const auto *header = reinterpret_cast<const COFFLargeImportHeader *>(mb.getBufferStart());
+SyntheticLargeImportData::SyntheticLargeImportData(SymbolTable &symtab, StringRef externalName) : LargeImportData(SyntheticLargeImportDataKind), symtab(symtab) {
+  this->internalName = externalName;
+  this->externalName = externalName;
+  this->importType = LARGE_LOADER_IMPORT_TYPE_WILDCARD;
+  this->importFlags = LARGE_LOADER_IMPORT_FLAGS_SYNTHETIC | LARGE_LOADER_IMPORT_FLAGS_WILDCARD_LOOKUP_WIN32_EXPORT_DIRECTORY;
 
-  switch (header->Machine) {
-  case AMD64:
-    return make<ImportThunkChunkX64>(ctx, impSym);
-  case I386:
-    return make<ImportThunkChunkX86>(ctx, impSym);
-  case ARM64:
-    return make<ImportThunkChunkARM64>(ctx, impSym, ARM64);
-  case ARMNT:
-    return make<ImportThunkChunkARM>(ctx, impSym);
-  }
-  llvm_unreachable("unknown machine type");
+  // Initialize the symbols now
+  createImportSymbols();
+}
+
+MachineTypes SyntheticLargeImportData::getMachineType() const {
+  return symtab.machine;
 }
 // </COFF_LARGE_EXPORTS>
 

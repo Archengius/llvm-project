@@ -627,6 +627,8 @@ private:
 class ImportThunkChunkARM64EC : public ImportThunkChunk {
 public:
   explicit ImportThunkChunkARM64EC(ImportFile *file);
+  // <COFF_LARGE_EXPORTS>
+  explicit ImportThunkChunkARM64EC(SymbolTable &symtab, Defined *impSym);
   size_t getSize() const override;
   MachineTypes getMachine() const override { return ARM64EC; }
   void writeTo(uint8_t *buf) const override;
@@ -638,7 +640,8 @@ public:
   bool extended = false;
 
 private:
-  ImportFile *file;
+  // <COFF_LARGE_EXPORTS>
+  SymbolTable &symtab;
 };
 
 class RangeExtensionThunkARM : public NonSectionCodeChunk {

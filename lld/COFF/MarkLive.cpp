@@ -61,16 +61,23 @@ void markLive(COFFLinkerContext &ctx) {
       sym->getChunk()->live = true;
     }
     // <COFF_LARGE_EXPORTS>
-    else if (auto *sym = dyn_cast<DefinedLargeImportData>(b)) {
-      // File might be null if the symbol was added as a fallback unresolved symbol
-      if (sym->file)
-        sym->file->live = true;
+    else if (auto *sym = dyn_cast<DefinedLargeImport>(b)) {
+      sym->file->markLive();
+      // Make sure to mark both the import check thunk, and it's exit thunk as referenced
+      if (sym->file->impchkThunk)
+        sym->file->impchkThunk->live = true;
+      if (sym->file->impchkThunk && sym->file->impchkThunk->exitThunk)
+        addSym(sym->file->impchkThunk->exitThunk);
     }
     else if (auto *sym = dyn_cast<DefinedLargeImportThunk>(b)) {
-      // File might be null if the symbol was added as a fallback unresolved symbol
-      if (sym->wrappedSym->getFile())
-        cast<LargeImportFile>(sym->wrappedSym->getFile())->live = true;
+      auto wrappedFile = sym->wrappedSym->file;
+      wrappedFile->markLive();
       sym->getChunk()->live = true;
+      // Make sure to mark both the import check thunk, and it's exit thunk as referenced
+      if (wrappedFile->impchkThunk)
+        wrappedFile->impchkThunk->live = true;
+      if (wrappedFile->impchkThunk && wrappedFile->impchkThunk->exitThunk)
+        addSym(wrappedFile->impchkThunk->exitThunk);
     }
     // </COFF_LARGE_EXPORTS>
   };

@@ -88,6 +88,7 @@ void dumpCOFFLargeImportFile(const COFFLargeImportFile *File, ScopedPrinter &Wri
     Writer.printString("Flags", join(SymbolFlags, " "));
   }
   const StringRef DllName = File->getDllName();
+  Writer.printString("Symbol name", File->getSymbolName());
   Writer.printString("Dll name", DllName.empty() ? "<wildcard>" : DllName);
   Writer.printString("Export name", File->getExportName());
 
