@@ -1002,8 +1002,13 @@ void LinkerDriver::createImportLibrary(bool asLib) {
   std::string path = getImplibPath();
 
   if (!ctx.config.incremental) {
-    checkError(writeImportLibrary(libName, path, exports, ctx.config.machine,
+    if (ctx.config.largeExports) {
+      checkError(writeLargeImportLibrary(libName, path, exports, ctx.config.machine,
                                   ctx.config.mingw, nativeExports));
+    } else {
+      checkError(writeImportLibrary(libName, path, exports, ctx.config.machine,
+                                  ctx.config.mingw, nativeExports));
+    }
     return;
   }
 
@@ -1012,8 +1017,13 @@ void LinkerDriver::createImportLibrary(bool asLib) {
   ErrorOr<std::unique_ptr<MemoryBuffer>> oldBuf = MemoryBuffer::getFile(
       path, /*IsText=*/false, /*RequiresNullTerminator=*/false);
   if (!oldBuf) {
-    checkError(writeImportLibrary(libName, path, exports, ctx.config.machine,
+    if (ctx.config.largeExports) {
+      checkError(writeLargeImportLibrary(libName, path, exports, ctx.config.machine,
                                   ctx.config.mingw, nativeExports));
+    } else {
+      checkError(writeImportLibrary(libName, path, exports, ctx.config.machine,
+                                  ctx.config.mingw, nativeExports));
+    }
     return;
   }
 
@@ -1023,11 +1033,18 @@ void LinkerDriver::createImportLibrary(bool asLib) {
     Fatal(ctx) << "cannot create temporary file for import library " << path
                << ": " << ec.message();
 
-  if (Error e =
-          writeImportLibrary(libName, tmpName, exports, ctx.config.machine,
-                             ctx.config.mingw, nativeExports)) {
-    checkError(std::move(e));
-    return;
+  if (ctx.config.largeExports) {
+    if (Error e = writeLargeImportLibrary(libName, tmpName, exports, ctx.config.machine,
+                                  ctx.config.mingw, nativeExports)) {
+      checkError(std::move(e));
+      return;
+    }
+  } else {
+    if (Error e = writeImportLibrary(libName, tmpName, exports, ctx.config.machine,
+                                  ctx.config.mingw, nativeExports)) {
+      checkError(std::move(e));
+      return;
+    }
   }
 
   std::unique_ptr<MemoryBuffer> newBuf = check(MemoryBuffer::getFile(
@@ -1039,96 +1056,6 @@ void LinkerDriver::createImportLibrary(bool asLib) {
     sys::fs::remove(tmpName);
   }
 }
-
-// <COFF_LARGE_EXPORTS>
-static const char LargeImportFileSignature[8] = {'!', '<', 'l', 'i', 'm', 'p', '>', '\n'}; // !<limp>\n
-
-void LinkerDriver::createLargeImportLibrary(bool asLib) {
-  llvm::TimeTraceScope timeScope("Create large import library");
-
-  std::string libName = path::filename(getImportName(asLib)).str();
-  BumpPtrAllocator localAllocator;
-
-  auto getExports = [&](SymbolTable &symtab, std::vector<NewArchiveMember> &importMembers, MachineTypes Machine) {
-    // Generate large import archive members for each export we have
-    for (Export &exp : symtab.exports) {
-
-      // Skip over private and constant exports
-      if (exp.isPrivate || exp.constant) continue;
-
-      bool isAliasedExport = exp.exportName != exp.name;
-      size_t totalImportSize = sizeof(COFFLargeImportHeader) + exp.name.size() + (ctx.config.forceNoDllNameInLib ? 0 : libName.size()) + (isAliasedExport ? exp.exportName.size() : 0);
-      char *importBufferStart = localAllocator.Allocate<char>(totalImportSize);
-
-      auto *hdr = reinterpret_cast<COFFLargeImportHeader *>(importBufferStart);
-      memcpy(hdr->Signature, LargeImportFileSignature, sizeof(hdr->Signature));
-      hdr->Machine = Machine;
-      hdr->Version = LARGE_LOADER_VERSION_ARM64EC_EXPORTAS;
-      hdr->Type = exp.data ? LARGE_LOADER_IMPORT_TYPE_DATA : LARGE_LOADER_IMPORT_TYPE_CODE;
-      hdr->Flags = LARGE_LOADER_IMPORT_FLAGS_NONE;
-      hdr->SizeOfInternalSymbolName = exp.name.size();
-      hdr->SizeOfDllNameHint = ctx.config.forceNoDllNameInLib ? 0 : libName.size();
-      hdr->SizeOfExternalSymbolName = isAliasedExport ? exp.exportName.size() : 0;
-
-      memcpy(importBufferStart + sizeof(COFFLargeImportHeader), exp.name.data(), exp.name.size());
-      memcpy(importBufferStart + sizeof(COFFLargeImportHeader) + exp.name.size(), libName.data(), ctx.config.forceNoDllNameInLib ? 0 : libName.size());
-      // Only write external symbol name if this is an aliased export
-      if (isAliasedExport)
-        memcpy(importBufferStart + sizeof(COFFLargeImportHeader) + exp.name.size() + (ctx.config.forceNoDllNameInLib ? 0 : libName.size()), exp.exportName.data(), exp.exportName.size());
-
-      importMembers.push_back(NewArchiveMember(MemoryBufferRef(StringRef(importBufferStart, totalImportSize), libName)));
-    }
-  };
-
-  // Adjust the target machine and native machine types if we are linking against Arm64EC
-  MachineTypes targetMachine = ctx.config.machine;
-  MachineTypes nativeMachine = targetMachine;
-  if (isArm64EC(targetMachine)) {
-    nativeMachine = IMAGE_FILE_MACHINE_ARM64;
-    targetMachine = IMAGE_FILE_MACHINE_ARM64EC;
-  }
-
-  // Write either a normal symtab or a hybrid symtab (for ARM64EC). The difference is the source symtab from which symbols come and the machine type the symbols are labelled with
-  std::vector<NewArchiveMember> importMembers;
-  if (ctx.hybridSymtab) {
-    getExports(ctx.symtab, importMembers, nativeMachine);
-    getExports(*ctx.hybridSymtab, importMembers, targetMachine);
-  } else {
-    getExports(ctx.symtab, importMembers, targetMachine);
-  }
-
-  std::string path = getImplibPath();
-  if (!ctx.config.incremental) {
-    checkError(writeArchive(path, importMembers, SymtabWritingMode::NormalSymtab, Archive::K_COFF, true, false));
-    return;
-  }
-
-  // If the import library already exists, replace it only if the contents
-  // have changed.
-  ErrorOr<std::unique_ptr<MemoryBuffer>> oldBuf = MemoryBuffer::getFile(path, /*IsText=*/false, /*RequiresNullTerminator=*/false);
-  if (!oldBuf) {
-    checkError(writeArchive(path, importMembers, SymtabWritingMode::NormalSymtab, Archive::K_COFF, true, false));
-    return;
-  }
-
-  SmallString<128> tmpName;
-  if (std::error_code ec = sys::fs::createUniqueFile(path + ".tmp-%%%%%%%%.lib", tmpName))
-    fatal("cannot create temporary file for import library " + path + ": " + ec.message());
-
-  if (Error e = writeArchive(tmpName, importMembers, SymtabWritingMode::NormalSymtab, Archive::K_COFF, true, false)) {
-    checkError(std::move(e));
-    return;
-  }
-
-  std::unique_ptr<MemoryBuffer> newBuf = check(MemoryBuffer::getFile(tmpName, /*IsText=*/false, /*RequiresNullTerminator=*/false));
-  if ((*oldBuf)->getBuffer() != newBuf->getBuffer()) {
-    oldBuf->reset();
-    checkError(errorCodeToError(sys::fs::rename(tmpName, path)));
-  } else {
-    sys::fs::remove(tmpName);
-  }
-}
-// </COFF_LARGE_EXPORTS>
 
 void LinkerDriver::enqueueTask(std::function<void()> task) {
   taskQueue.push_back(std::move(task));
@@ -1619,7 +1546,7 @@ void LinkerDriver::linkerMain(ArrayRef<const char *> argsArr) {
   llvm::TimeTraceScope timeScope("COFF link");
 
   // <COFF_LARGE_EXPORTS>
-  config->largeExports = args.hasArg(OPT_COFF_LARGE_EXPORTS);
+  config->largeExports = args.hasArg(OPT_COFF_LARGE_LOADER);
   config->forceNoDllNameInLib = args.hasArg(OPT_COFF_WILDCARD_IMPORT_LIB);
   config->autoWildcardImport = args.hasArg(OPT_COFF_AUTO_WILDCARD_IMPORT);
   // </COFF_LARGE_EXPORTS>
@@ -2434,15 +2361,7 @@ void LinkerDriver::linkerMain(ArrayRef<const char *> argsArr) {
   if (!args.hasArg(OPT_INPUT, OPT_wholearchive_file)) {
     ctx.forEachSymtab([](SymbolTable &symtab) { symtab.fixupExports(); });
     if (!config->noimplib)
-      // <COFF_LARGE_EXPORTS> Handle import library generation for large exports
-      if (config->largeExports) {
-        ctx.forEachSymtab(
-          [](SymbolTable &symtab) { symtab.validateLargeExports(); });
-        createLargeImportLibrary(true);
-      }
-      else
-        createImportLibrary(/*asLib=*/true);
-      // </COFF_LARGE_EXPORTS>
+      createImportLibrary(/*asLib=*/true);
     return;
   }
 
@@ -2825,18 +2744,11 @@ void LinkerDriver::linkerMain(ArrayRef<const char *> argsArr) {
     llvm::TimeTraceScope timeScope("Create .lib exports");
     ctx.forEachSymtab([](SymbolTable &symtab) { symtab.fixupExports(); });
 
-    // <COFF_LARGE_EXPORTS> Handle large import library generation
-    if (config->largeExports) {
+    if (!config->noimplib && (!config->mingw || !config->implib.empty()))
+      createImportLibrary(/*asLib=*/false);
+    if (!config->largeExports)
       ctx.forEachSymtab(
-          [](SymbolTable &symtab) { symtab.validateLargeExports(); });
-      createLargeImportLibrary(false);
-    } else {
-      if (!config->noimplib && (!config->mingw || !config->implib.empty()))
-        createImportLibrary(/*asLib=*/false);
-      ctx.forEachSymtab(
-          [](SymbolTable &symtab) { symtab.assignExportOrdinals(); });
-    }
-    // </COFF_LARGE_EXPORTS>
+        [](SymbolTable &symtab) { symtab.assignExportOrdinals(); });
   }
 
   // Handle /output-def (MinGW specific).

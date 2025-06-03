@@ -139,9 +139,6 @@ private:
   std::string getImportName(bool asLib);
 
   void createImportLibrary(bool asLib);
-  // <COFF_LARGE_EXPORTS>
-  void createLargeImportLibrary(bool asLib);
-  // </COFF_LARGE_EXPORTS>
 
   // Used by the resolver to parse .drectve section contents.
   void parseDirectives(InputFile *file);

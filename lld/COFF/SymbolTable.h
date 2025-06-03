@@ -192,9 +192,6 @@ public:
   void assignExportOrdinals();
   void parseModuleDefs(StringRef path);
   void parseAlternateName(StringRef);
-  // <COFF_LARGE_EXPORTS>
-  void validateLargeExports();
-  // </COFF_LARGE_EXPORTS>
 
   // Iterates symbols in non-determinstic hash table order.
   template <typename T> void forEachSymbol(T callback) {

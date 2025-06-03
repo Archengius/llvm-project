@@ -18,6 +18,7 @@
 #include "llvm/Object/Archive.h"
 #include "llvm/Object/ArchiveWriter.h"
 #include "llvm/Object/COFF.h"
+#include "llvm/Object/COFFLargeImport.h"
 #include "llvm/Support/Allocator.h"
 #include "llvm/Support/Endian.h"
 #include "llvm/Support/Error.h"
@@ -252,6 +253,15 @@ public:
                                      ImportType Type, ImportNameType NameType,
                                      StringRef ExportName,
                                      MachineTypes Machine);
+
+  // <COFF_LARGE_EXPORTS>
+  // Create a short import file for Large Loader import descriptor
+  NewArchiveMember createShortLargeImport(StringRef Sym,
+                                      StringRef ExportName,
+                                      COFFLargeLoaderImportType ImportType,
+                                      COFFLargeLoaderImportFlags ImportFlags,
+                                      MachineTypes Machine);
+  // </COFF_LARGE_EXPORTS>
 
   // Create a weak external file which is described in PE/COFF Aux Format 3.
   NewArchiveMember createWeakExternal(StringRef Sym, StringRef Weak, bool Imp,
@@ -576,6 +586,40 @@ ObjectFactory::createShortImport(StringRef Sym, uint16_t Ordinal,
   return {MemoryBufferRef(StringRef(Buf, Size), ImportName)};
 }
 
+// <COFF_LARGE_EXPORTS>
+NewArchiveMember ObjectFactory::createShortLargeImport(
+    StringRef Sym, StringRef ExportName,
+    COFFLargeLoaderImportType ImportType,
+    COFFLargeLoaderImportFlags ImportFlags,
+    MachineTypes Machine) {
+
+  size_t Size = sizeof(COFFLargeImportHeader) + Sym.size() +
+    ImportName.size() + ExportName.size();
+  char *P = Alloc.Allocate<char>(Size);
+
+  auto *LargeImp = reinterpret_cast<COFFLargeImportHeader *>(P);
+  memcpy(LargeImp->Signature, "!<limp>\n", sizeof(LargeImp->Signature));
+  LargeImp->Machine = Machine;
+  LargeImp->Version = LARGE_LOADER_VERSION_ARM64EC_EXPORTAS;
+  LargeImp->Type = ImportType;
+  LargeImp->Flags = ImportFlags;
+  LargeImp->SizeOfInternalSymbolName = Sym.size();
+  LargeImp->SizeOfDllNameHint = ImportName.size();
+  LargeImp->SizeOfExternalSymbolName = ExportName.size();
+
+  memcpy(P + sizeof(COFFLargeImportHeader), Sym.data(),
+    Sym.size());
+  memcpy(P + sizeof(COFFLargeImportHeader) + Sym.size(),
+    ImportName.data(), ImportName.size());
+  // Only write external symbol name if this is an aliased export
+  if (!ExportName.empty())
+    memcpy(P + sizeof(COFFLargeImportHeader) + Sym.size() + ImportName.size(),
+      ExportName.data(), ExportName.size());
+
+  return {MemoryBufferRef(StringRef(P, Size), ImportName)};
+}
+// </COFF_LARGE_EXPORTS>
+
 NewArchiveMember ObjectFactory::createWeakExternal(StringRef Sym,
                                                    StringRef Weak, bool Imp,
                                                    MachineTypes Machine) {
@@ -802,6 +846,75 @@ Error writeImportLibrary(StringRef ImportName, StringRef Path,
                       /*Deterministic*/ true, /*Thin*/ false,
                       /*OldArchiveBuf*/ nullptr, isArm64EC(Machine));
 }
+
+// <COFF_LARGE_EXPORTS>
+Error writeLargeImportLibrary(StringRef ImportName, StringRef Path,
+                              ArrayRef<COFFShortExport> Exports,
+                              COFF::MachineTypes Machine, bool MinGW,
+                              ArrayRef<COFFShortExport> NativeExports) {
+  MachineTypes NativeMachine = Machine;
+  if (isArm64EC(Machine)) {
+    NativeMachine = IMAGE_FILE_MACHINE_ARM64;
+    Machine = IMAGE_FILE_MACHINE_ARM64EC;
+  }
+
+  std::vector<NewArchiveMember> Members;
+  ObjectFactory OF(sys::path::filename(ImportName), NativeMachine);
+
+  auto AddExports = [&](ArrayRef<COFFShortExport> Exp, MachineTypes M) -> Error {
+    for (const COFFShortExport &E : Exp) {
+      if (E.Private || E.Constant)
+        continue;
+
+      COFFLargeLoaderImportType ImportType = LARGE_LOADER_IMPORT_TYPE_CODE;
+      if (E.Data)
+        ImportType = LARGE_LOADER_IMPORT_TYPE_DATA;
+      COFFLargeLoaderImportFlags ImportFlags = LARGE_LOADER_IMPORT_FLAGS_NONE;
+
+      StringRef SymbolName = E.SymbolName.empty() ? E.Name : E.SymbolName;
+      std::string Name;
+
+      if (E.ExtName.empty()) {
+        Name = std::string(SymbolName);
+      } else {
+        Expected<std::string> ReplacedName =
+            object::replace(SymbolName, E.Name, E.ExtName);
+        if (!ReplacedName)
+          return ReplacedName.takeError();
+        Name.swap(*ReplacedName);
+      }
+
+      // Nameless exports are not supported, and forwarder exports are not supported either
+      if (E.Noname) {
+        return make_error<StringError>(StringRef(
+          (Twine("Nameless exports are not supported for large export libraries. "
+            "Found by ordinal export ") + E.Name).str()),
+            object_error::parse_failed);
+      }
+      if (!E.ImportName.empty()) {
+        return make_error<StringError>(StringRef(
+          (Twine("Forwarder imports are not supported for large export libraries. "
+            "Found export ") + E.Name + " forwarding to " + E.ImportName).str()),
+            object_error::parse_failed);
+      }
+
+      Members.push_back(OF.createShortLargeImport(
+        E.Name, E.ExportAs, ImportType, ImportFlags, Machine));
+    }
+    return Error::success();
+  };
+
+  if (Error E = AddExports(Exports, Machine))
+    return E;
+  if (Error E = AddExports(NativeExports, NativeMachine))
+    return E;
+
+  return writeArchive(Path, Members, SymtabWritingMode::NormalSymtab,
+                      object::Archive::K_COFF,
+                      /*Deterministic*/ true, /*Thin*/ false,
+                      /*OldArchiveBuf*/ nullptr, isArm64EC(Machine));
+}
+// </COFF_LARGE_EXPORTS>
 
 } // namespace object
 } // namespace llvm

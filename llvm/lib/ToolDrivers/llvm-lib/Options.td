@@ -24,6 +24,13 @@ def lst    : F<"list">, HelpText<"List contents of .lib file on stdout">;
 def out    : P<"out", "Path to file to write output">;
 def deffile : P<"def", "def file to use to generate import library">;
 def nativedeffile : P<"defArm64Native", "def file to use to generate native ARM64 symbols in ARM64EC import library">;
+def createimportlibrary : F<"def">, HelpText<"Create an import library from the export directives from input object files">;
+def libname : P<"name", "Name of the import library to create. If not provided, output filename is used">;
+
+// <COFF_LARGE_EXPORTS>
+def largeloader : F<"largeloader">,
+    HelpText<"Create Large Loader Import Library">;
+// </COFF_LARGE_EXPORTS>
 
 def llvmlibthin : F<"llvmlibthin">,
     HelpText<"Make .lib point to .obj files instead of copying their contents">;
@@ -54,3 +61,4 @@ def nodefaultlib_all: F<"nodefaultlib">;
 def nologo : F<"nologo">;
 def subsystem : P<"subsystem", "">;
 def verbose : F<"verbose">;
+def errorreport : P<"errorreport", "">;

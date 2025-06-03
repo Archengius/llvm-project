@@ -139,7 +139,14 @@ Error writeImportLibrary(StringRef ImportName, StringRef Path,
                          ArrayRef<COFFShortExport> Exports,
                          COFF::MachineTypes Machine, bool MinGW,
                          ArrayRef<COFFShortExport> NativeExports = {});
-
+// <COFF_LARGE_EXPORTS>
+/// Writes Large Exports import library containing the entries described by the Exports
+/// array. Exports by ordinal and forwarders are not supported in Large Exports mode
+Error writeLargeImportLibrary(StringRef ImportName, StringRef Path,
+                         ArrayRef<COFFShortExport> Exports,
+                         COFF::MachineTypes Machine, bool MinGW,
+                         ArrayRef<COFFShortExport> NativeExports = {});
+// </COFF_LARGE_EXPORTS>
 } // namespace object
 } // namespace llvm
 

@@ -1152,6 +1152,11 @@ private:
 void LargeLoaderImportDataContents::setupLargeLoaderDllOrder(COFFLinkerContext &ctx, int maxLoadOrder) const {
   StringRef loaderLibraryName = saver().save("LargeLoader.dll");
 
+  // Move all existing dll loading order rules up by one. We cannot have two DLLs with the same load order because
+  // it breaks logic in binImports and results in incorrectly grouping imports from different DLLs together
+  for (auto& dllLoadOrderEntry : ctx.config.dllOrder)
+    dllLoadOrderEntry.second++;
+
   // Make sure the large loader DLL is loaded before any other DLLs with large
   // imports, but respect user specified load order if possible
   std::string loaderLibraryNameLowercase = loaderLibraryName.lower();

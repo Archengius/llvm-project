@@ -20,6 +20,7 @@
 #include "llvm/Object/ArchiveWriter.h"
 #include "llvm/Object/COFF.h"
 #include "llvm/Object/COFFModuleDefinition.h"
+#include "llvm/Object/IRObjectFile.h"
 #include "llvm/Object/WindowsMachineFlag.h"
 #include "llvm/Option/Arg.h"
 #include "llvm/Option/ArgList.h"
@@ -313,6 +314,233 @@ static void appendFile(std::vector<NewArchiveMember> &Members,
   Members.emplace_back(MB);
 }
 
+static Expected<COFFShortExport> parseExportDirective(StringRef Arg) {
+  COFFShortExport E;
+  StringRef Rest;
+  StringRef NameRef;
+  std::tie(NameRef, Rest) = Arg.split(",");
+  if (NameRef.empty())
+    goto err;
+  E.Name = NameRef;
+  if (NameRef.contains('=')) {
+    auto [x, y] = NameRef.split("=");
+
+    // If "<name>=<dllname>.<name>".
+    if (y.contains(".")) {
+      E.Name = x;
+      E.ImportName = y;
+    } else {
+      E.ExtName = x;
+      E.Name = y;
+      if (E.Name.empty())
+        goto err;
+    }
+  }
+  // Optional parameters
+  // "[,@ordinal[,NONAME]][,DATA][,PRIVATE][,EXPORTAS,exportname]"
+  while (!Rest.empty()) {
+    StringRef tok;
+    std::tie(tok, Rest) = Rest.split(",");
+    if (tok.equals_insensitive("noname")) {
+      if (E.Ordinal == 0)
+        goto err;
+      E.Noname = true;
+      continue;
+    }
+    if (tok.equals_insensitive("data")) {
+      E.Data = true;
+      continue;
+    }
+    if (tok.equals_insensitive("constant")) {
+      E.Constant = true;
+      continue;
+    }
+    if (tok.equals_insensitive("private")) {
+      E.Private = true;
+      continue;
+    }
+    if (tok.equals_insensitive("exportas")) {
+      if (!Rest.empty() && !Rest.contains(','))
+        E.ExportAs = Rest;
+      else
+        return createStringError(inconvertibleErrorCode(),
+          "invalid EXPORTAS value: " + Rest);
+      break;
+    }
+    if (tok.starts_with("@")) {
+      int32_t ord;
+      if (tok.substr(1).getAsInteger(0, ord))
+        goto err;
+      if (ord <= 0 || 65535 < ord)
+        goto err;
+      E.Ordinal = ord;
+      continue;
+    }
+    goto err;
+  }
+  return E;
+  err: return createStringError(inconvertibleErrorCode(),
+    "invalid /export: " + Arg);
+}
+
+static Error parseFileExportDirectives(std::vector<COFFShortExport> &Exports, StringRef Directives, StringSaver& Saver) {
+  // We only care about EXPORT directives here, the rest are not relevant for module interface
+  SmallVector<StringRef, 16> Tokens;
+  cl::TokenizeWindowsCommandLineNoCopy(Directives, Saver, Tokens);
+  for (StringRef Token : Tokens) {
+    if (Token.starts_with_insensitive("/export:") ||
+        Token.starts_with_insensitive("-export:")) {
+      StringRef ExportDirective = Token.substr(strlen("/export:"));
+      auto ParsedExportDirective = parseExportDirective(ExportDirective);
+      if (!ParsedExportDirective) {
+        return ParsedExportDirective.takeError();
+      }
+      Exports.push_back(std::move(ParsedExportDirective.get()));
+    }
+  }
+  return Error::success();
+}
+
+static void appendFileModuleDefs(std::vector<COFFShortExport> &Exports,
+                       std::vector<COFFShortExport> &NativeExports,
+                       COFF::MachineTypes &LibMachine,
+                       std::string &LibMachineSource, MemoryBufferRef MB,
+                       StringSaver& Saver) {
+  file_magic Magic = identify_magic(MB.getBuffer());
+
+  if (Magic != file_magic::coff_object && Magic != file_magic::bitcode &&
+      Magic != file_magic::archive && Magic != file_magic::windows_resource &&
+      Magic != file_magic::coff_import_library) {
+    llvm::errs() << MB.getBufferIdentifier()
+                 << ": not a COFF object, bitcode, archive, import library or "
+                    "resource file\n";
+    exit(1);
+  }
+
+  // Same logic here as in appendFile, archives are extracted to discover
+  // module definitions from object files contained in them for lib.exe compatibility
+  if (Magic == file_magic::archive) {
+    Error Err = Error::success();
+    object::Archive Archive(MB, Err);
+    fatalOpenError(std::move(Err), MB.getBufferIdentifier());
+
+    for (auto &C : Archive.children(Err)) {
+      Expected<MemoryBufferRef> ChildMB = C.getMemoryBufferRef();
+      if (!ChildMB) {
+        handleAllErrors(ChildMB.takeError(), [&](const ErrorInfoBase &EIB) {
+          llvm::errs() << MB.getBufferIdentifier() << ": " << EIB.message()
+                       << "\n";
+        });
+        exit(1);
+      }
+      appendFileModuleDefs(Exports, NativeExports, LibMachine, LibMachineSource, *ChildMB, Saver);
+    }
+    fatalOpenError(std::move(Err), MB.getBufferIdentifier());
+    return;
+  }
+
+  // Validate that all provided files have the same machine type
+  if (Magic == file_magic::coff_object || Magic == file_magic::bitcode) {
+    Expected<COFF::MachineTypes> MaybeFileMachine =
+        (Magic == file_magic::coff_object) ? getCOFFFileMachine(MB)
+                                           : getBitcodeFileMachine(MB);
+    if (!MaybeFileMachine) {
+      handleAllErrors(MaybeFileMachine.takeError(),
+                      [&](const ErrorInfoBase &EIB) {
+                        llvm::errs() << MB.getBufferIdentifier() << ": "
+                                     << EIB.message() << "\n";
+                      });
+      exit(1);
+    }
+    COFF::MachineTypes FileMachine = *MaybeFileMachine;
+
+    // FIXME: Once lld-link rejects multiple resource .obj files:
+    // Call convertResToCOFF() on .res files and add the resulting
+    // COFF file to the .lib output instead of adding the .res file, and remove
+    // this check. See PR42180.
+    if (FileMachine != COFF::IMAGE_FILE_MACHINE_UNKNOWN) {
+      if (LibMachine == COFF::IMAGE_FILE_MACHINE_UNKNOWN) {
+        if (FileMachine == COFF::IMAGE_FILE_MACHINE_ARM64EC) {
+            llvm::errs() << MB.getBufferIdentifier() << ": file machine type "
+                         << machineToStr(FileMachine)
+                         << " conflicts with inferred library machine type,"
+                         << " use /machine:arm64ec or /machine:arm64x\n";
+            exit(1);
+        }
+        LibMachine = FileMachine;
+        LibMachineSource =
+            (" (inferred from earlier file '" + MB.getBufferIdentifier() + "')")
+                .str();
+      } else if (!machineMatches(LibMachine, FileMachine)) {
+        llvm::errs() << MB.getBufferIdentifier() << ": file machine type "
+                     << machineToStr(FileMachine)
+                     << " conflicts with library machine type "
+                     << machineToStr(LibMachine) << LibMachineSource << '\n';
+        exit(1);
+      }
+    }
+
+    // If this is a native ARM64 object file being added to the ARM64X import library, we should
+    // add the exports from this file to NativeExports, not to Exports
+    bool shouldUseNativeExports = FileMachine == COFF::IMAGE_FILE_MACHINE_ARM64 &&
+      (LibMachine == COFF::IMAGE_FILE_MACHINE_ARM64EC || LibMachine == COFF::IMAGE_FILE_MACHINE_ARM64X);
+
+    // Parse directive definitions from COFF object files
+    if (Magic == file_magic::coff_object) {
+      auto Obj = COFFObjectFile::create(MB);
+      if (!Obj) {
+        fatalOpenError(Obj.takeError(), MB.getBufferIdentifier());
+        return;
+      }
+      for (uint32_t SectionIndex = 1; SectionIndex < Obj->get()->getNumberOfSections(); SectionIndex++) {
+        auto SectionHeader = Obj->get()->getSection(SectionIndex);
+        if (!SectionHeader) {
+          fatalOpenError(SectionHeader.takeError(), MB.getBufferIdentifier());
+          return;
+        }
+        auto SectionName = Obj->get()->getSectionName(SectionHeader.get());
+        if (!SectionName) {
+          fatalOpenError(SectionName.takeError(), MB.getBufferIdentifier());
+          return;
+        }
+        // Parse the directives section from the object file
+        if (SectionName.get() == ".drectve") {
+          ArrayRef<uint8_t> ObjectFileDirectivesBuffer;
+          auto SectionReadError = Obj->get()->getSectionContents(
+            SectionHeader.get(), ObjectFileDirectivesBuffer);
+          if (SectionReadError) {
+            fatalOpenError(std::move(SectionReadError), MB.getBufferIdentifier());
+            return;
+          }
+          auto DirectivesString = StringRef((const char *)ObjectFileDirectivesBuffer.data(),
+            ObjectFileDirectivesBuffer.size());
+          auto ParseError = parseFileExportDirectives(shouldUseNativeExports ?
+            NativeExports : Exports, DirectivesString, Saver);
+          if (ParseError) {
+            fatalOpenError(std::move(ParseError), MB.getBufferIdentifier());
+            return;
+          }
+        }
+      }
+    }
+    // Parse directive definitions from the bitcode import directives
+    if (Magic == file_magic::bitcode) {
+      // We only need to read the symtab to parse the directives
+      auto BitcodeFileSymtab = readIRSymtab(MB);
+      if (!BitcodeFileSymtab) {
+        fatalOpenError(BitcodeFileSymtab.takeError(), MB.getBufferIdentifier());
+      }
+      auto DirectivesString =  BitcodeFileSymtab->TheReader.getCOFFLinkerOpts();
+      auto ParseError = parseFileExportDirectives(shouldUseNativeExports ?
+        NativeExports : Exports, DirectivesString, Saver);
+      if (ParseError) {
+        fatalOpenError(std::move(ParseError), MB.getBufferIdentifier());
+        return;
+      }
+    }
+  }
+}
+
 int llvm::libDriverMain(ArrayRef<const char *> ArgsArr) {
   BumpPtrAllocator Alloc;
   StringSaver Saver(Alloc);
@@ -367,7 +595,7 @@ int llvm::libDriverMain(ArrayRef<const char *> ArgsArr) {
         std::string(" (from '/machine:") + Arg->getValue() + "' flag)";
   }
 
-  // create an import library
+  // create an import library from a module definition file
   if (Args.hasArg(OPT_deffile)) {
 
     if (OutputPath.empty()) {
@@ -425,13 +653,85 @@ int llvm::libDriverMain(ArrayRef<const char *> ArgsArr) {
       OutputFile = std::move(NativeDef->OutputFile);
     }
 
-    if (Error E =
-            writeImportLibrary(OutputFile, OutputPath, Def->Exports, LibMachine,
-                               /*MinGW=*/false, NativeExports)) {
-      handleAllErrors(std::move(E), [&](const ErrorInfoBase &EI) {
-        llvm::errs() << OutputPath << ": " << EI.message() << "\n";
-      });
+    if (Args.hasArg(OPT_largeloader)) {
+      if (Error E = writeLargeImportLibrary(OutputFile, OutputPath,
+      Def->Exports, LibMachine, /*MinGW=*/false, NativeExports)) {
+        handleAllErrors(std::move(E), [&](const ErrorInfoBase &EI) {
+          llvm::errs() << OutputPath << ": " << EI.message() << "\n";
+        });
+        return 1;
+      }
+    } else {
+      if (Error E = writeImportLibrary(OutputFile, OutputPath,
+        Def->Exports, LibMachine, /*MinGW=*/false, NativeExports)) {
+        handleAllErrors(std::move(E), [&](const ErrorInfoBase &EI) {
+          llvm::errs() << OutputPath << ": " << EI.message() << "\n";
+        });
+        return 1;
+      }
+    }
+    return 0;
+  }
+
+  std::vector<StringRef> SearchPaths = getSearchPaths(&Args, Saver);
+  StringSet<> Seen;
+
+  // create an import library from the export directives of the provided object
+  // and bitcode files. Name is derived from the filename or can be provided
+  // with /NAME command line argument
+  if (Args.hasArg(OPT_createimportlibrary)) {
+
+    if (OutputPath.empty()) {
+      llvm::errs() << "no output path given\n";
       return 1;
+    }
+
+    std::vector<COFFShortExport> Exports;
+    std::vector<COFFShortExport> NativeExports;
+
+    // Parse directives from all input object and bitcode files to gather exports
+    for (auto *Arg : Args.filtered(OPT_INPUT)) {
+      // Find a file
+      std::string Path = findInputFile(Arg->getValue(), SearchPaths);
+      if (Path.empty()) {
+        llvm::errs() << Arg->getValue() << ": no such file or directory\n";
+        return 1;
+      }
+      // Same logic as when creating archives, input files are processed only once
+      if (!Seen.insert(Path).second)
+        continue;
+
+      // Open a file.
+      ErrorOr<std::unique_ptr<MemoryBuffer>> MOrErr = MemoryBuffer::getFile(
+          Path, /*IsText=*/false, /*RequiresNullTerminator=*/false);
+      fatalOpenError(errorCodeToError(MOrErr.getError()), Path);
+      MemoryBufferRef MBRef = (*MOrErr)->getMemBufferRef();
+
+      // Gather module definitions from the file
+      appendFileModuleDefs(Exports, NativeExports, LibMachine, LibMachineSource, MBRef, Saver);
+    }
+
+    // If /NAME is specified on command line, use that, otherwise use the filename
+    // of output path as an import library name
+    std::string OutputFile = Args.hasArg(OPT_libname) ?
+      Args.getLastArg(OPT_libname)->getValue() : sys::path::filename(OutputPath).str();
+
+    if (Args.hasArg(OPT_largeloader)) {
+      if (Error E = writeLargeImportLibrary(OutputFile, OutputPath,
+      Exports, LibMachine, /*MinGW=*/false, NativeExports)) {
+        handleAllErrors(std::move(E), [&](const ErrorInfoBase &EI) {
+          llvm::errs() << OutputPath << ": " << EI.message() << "\n";
+        });
+        return 1;
+      }
+    } else {
+      if (Error E = writeImportLibrary(OutputFile, OutputPath,
+        Exports, LibMachine, /*MinGW=*/false, NativeExports)) {
+        handleAllErrors(std::move(E), [&](const ErrorInfoBase &EI) {
+          llvm::errs() << OutputPath << ": " << EI.message() << "\n";
+        });
+        return 1;
+      }
     }
     return 0;
   }
@@ -456,10 +756,7 @@ int llvm::libDriverMain(ArrayRef<const char *> ArgsArr) {
     return 0;
   }
 
-  std::vector<StringRef> SearchPaths = getSearchPaths(&Args, Saver);
-
   std::vector<std::unique_ptr<MemoryBuffer>> MBs;
-  StringSet<> Seen;
   std::vector<NewArchiveMember> Members;
 
   // Create a NewArchiveMember for each input file.

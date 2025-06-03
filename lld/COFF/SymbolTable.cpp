@@ -1333,38 +1333,6 @@ void SymbolTable::assignExportOrdinals() {
                << Twine(std::numeric_limits<uint16_t>::max()) << ")";
 }
 
-// <COFF_LARGE_EXPORTS>
-void SymbolTable::validateLargeExports() {
-  bool exportValidationFailed = false;
-
-  for (Export &e : exports) {
-    // Unnamed/ordinal-only exports are not supported in large exports mode
-    if (e.noname) {
-      exportValidationFailed = false;
-      Err(ctx) << "Found unnamed DLL Export " << e.name << " with ordinal " << std::to_string(e.ordinal) << ". Unnamed exports are not supported in Large Loader/Large Exports mode.";
-    }
-    // Large exports do not support forwarding
-    if (!e.forwardTo.empty()) {
-      exportValidationFailed = true;
-      Err(ctx) << "DLL Export Forwarding is not supported in Large Loader/Large Exports mode. Tried to forward " << e.name + " to " << e.forwardTo;
-    }
-    // Large exports do not support MiNGW alternate imports
-    if (!e.importName.empty()) {
-      exportValidationFailed = false;
-      Err(ctx) << "DLL GNU/MinGW like alternate imports are not supported in Large Loader/Large Exports mode. Tried to alias export " << e.name << " to " << e.importName;
-    }
-    // Large exports do not use ordinals, so warn when the explicit ordinals are specified for large exports
-    if (e.ordinal != 0)
-      Warn(ctx) << "Explicit ordinal was specified for an export " << e.name << ". Large Loader does not use ordinals, so the explicit ordinal value will be ignored.";
-  }
-
-  // Abort immediately if we found any unsupported exports
-  if (exportValidationFailed) {
-    Fatal(ctx) << "Failed to validate exports for output file";
-  }
-}
-// </COFF_LARGE_EXPORTS>
-
 void SymbolTable::parseModuleDefs(StringRef path) {
   llvm::TimeTraceScope timeScope("Parse def file");
   std::unique_ptr<MemoryBuffer> mb =

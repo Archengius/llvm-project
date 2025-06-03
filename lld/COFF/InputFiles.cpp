@@ -1404,8 +1404,9 @@ void LargeImportFile::parse() {
   const auto *header = reinterpret_cast<const COFFLargeImportHeader *>(mb.getBufferStart());
 
   // Make sure the version of the header file is supported
-  if (header->Version != 1)
-    Fatal(symtab.ctx) << "Received large import file with unknown version number " << std::to_string(header->Version) << ". Latest version supported by this linker is 1.";
+  if (header->Version > LARGE_LOADER_VERSION_ARM64EC_EXPORTAS)
+    Fatal(symtab.ctx) << "Received large import file with unknown version number " << std::to_string(header->Version) << ". Latest version supported by this linker is " +
+      (uint16_t)LARGE_LOADER_VERSION_ARM64EC_EXPORTAS << ".";
 
   // Make sure the data is not corrupted. We should have at least enough data to cover DLL name, header and export name. Additional metadata after the import is permitted.
   if (mb.getBufferSize() < (sizeof(COFFLargeImportHeader) + header->SizeOfInternalSymbolName + header->SizeOfDllNameHint))
