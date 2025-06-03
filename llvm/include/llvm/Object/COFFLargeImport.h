@@ -25,6 +25,7 @@ namespace object {
 enum COFFLargeLoaderVersion : unsigned short int {
   LARGE_LOADER_VERSION_INITIAL = 1, /// Initial Large Loader implementation for AMD64 architecture
   LARGE_LOADER_VERSION_ARM64EC_EXPORTAS = 2, /// Large Loader compatibility with ARM64 and ARM64EC, EXPORTAS support in export definitions
+  LARGE_LOADER_VERSION_CIRCULAR_DEPS = 3, /// Large Loader can process circular dependencies across imported libraries
 };
 
 enum COFFLargeLoaderImportType : unsigned char {
@@ -103,6 +104,8 @@ struct COFFLargeLoaderExportDirectory {
   support::aligned_ulittle32_t ImageFilenameOffset; /// Offset to the name of this image from the start of the section. Used for debugging and error messages. Name is null terminated
   support::aligned_ulittle32_t ImageFilenameLength; /// Length of the name of the image. Does not include null terminator
   support::aligned_ulittle32_t AuxExportRVATableOffset; /// Added in Version 2. Only present on ARM64EC, value is zero on other architectures. Offset to the Auxiliary RVA table containing RVAs of exported native ARM64EC code. Normal export table contains x64 code instead.
+  support::aligned_little32_t  ImportSectionHeaderOffset; /// Offset to the start of the large import section header of this image from the start of the section. Zero if this image does not have a large import section
+  support::aligned_ulittle32_t ImportSectionHeaderLength; /// Length of the large import section header for this image, in bytes. Zero if this image does not have a large import section
 };
 
 }

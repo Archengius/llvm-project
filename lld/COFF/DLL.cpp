@@ -1120,10 +1120,10 @@ class LargeLoaderExportSectionHeaderChunk final : public NonSectionChunk {
 public:
   LargeLoaderExportSectionHeaderChunk(
       const COFFLargeLoaderExportDirectory &header, Chunk *exportRVATable, Chunk *auxExportRVATable,
-      Chunk *exportHashBucketTable, Chunk *exportTable, Chunk *imageNameChunk)
+      Chunk *exportHashBucketTable, Chunk *exportTable, Chunk *imageNameChunk, Chunk *importSectionHeaderChunk)
       : sectionHeader(header), exportRVATable(exportRVATable), auxExportRVATable(auxExportRVATable),
         exportHashBucketTable(exportHashBucketTable), exportTable(exportTable),
-        imageNameChunk(imageNameChunk) {
+        imageNameChunk(imageNameChunk), importSectionHeaderChunk(importSectionHeaderChunk) {
     setAlignment(alignof(COFFLargeLoaderExportDirectory));
   }
 
@@ -1138,6 +1138,8 @@ public:
     write32le(buf + offsetof(COFFLargeLoaderExportDirectory, ImageFilenameOffset), imageNameChunk->getRVA() - getRVA());
     write32le(buf + offsetof(COFFLargeLoaderExportDirectory, ExportRVATableOffset), exportRVATable->getRVA() - getRVA());
     write32le(buf + offsetof(COFFLargeLoaderExportDirectory, AuxExportRVATableOffset), auxExportRVATable ? (auxExportRVATable->getRVA() - getRVA()) : 0);
+    // Since this field is a signed int32 value, we need to convert RVAs to be signed before calculating the offset, and then reinterpret the value as int32 for write32le
+    write32le(buf + offsetof(COFFLargeLoaderExportDirectory, ImportSectionHeaderOffset), importSectionHeaderChunk ? (uint32_t)((int32_t)importSectionHeaderChunk->getRVA() - (int32_t)getRVA()) : 0);
   }
 
 private:
@@ -1147,6 +1149,7 @@ private:
   Chunk *exportHashBucketTable;
   Chunk *exportTable;
   Chunk *imageNameChunk;
+  Chunk *importSectionHeaderChunk;
 };
 
 void LargeLoaderImportDataContents::setupLargeLoaderDllOrder(COFFLinkerContext &ctx, int maxLoadOrder) const {
@@ -1394,7 +1397,7 @@ void LargeLoaderImportDataContents::createLargeIdataChunks(SymbolTable &symtab, 
 
   // Create import section header chunk
   COFFLargeLoaderImportDirectory sectionHeader{};
-  sectionHeader.Version = LARGE_LOADER_VERSION_ARM64EC_EXPORTAS;
+  sectionHeader.Version = LARGE_LOADER_VERSION_CIRCULAR_DEPS;
   sectionHeader.NumExportSections = static_cast<uint16_t>(importedDllExportDirectoryChunks.size());
   sectionHeader.NumImports = static_cast<uint32_t>(importChunks.size());
   sectionHeader.SingleImportSize = static_cast<uint32_t>(importChunks[0]->getSize());
@@ -1403,16 +1406,16 @@ void LargeLoaderImportDataContents::createLargeIdataChunks(SymbolTable &symtab, 
   // Imported export section chunks are optional, if all imports are wildcard we will not have any
   Chunk *firstImportedExportDirectoryChunk = importedDllExportDirectoryChunks.empty() ? nullptr : importedDllExportDirectoryChunks[0];
   Chunk *firstAuxAddressTableChunk = auxiliaryAddressTableChunks.empty() ? nullptr : auxiliaryAddressTableChunks[0];
-  Chunk *importDirectoryChunk = make<LargeLoaderImportSectionHeaderChunk>(sectionHeader, addressTableChunks[0], firstAuxAddressTableChunk, firstImportedExportDirectoryChunk, importChunks[0], imageNameChunk);
+  symtab.largeLoaderImportSectionHeaderChunk = make<LargeLoaderImportSectionHeaderChunk>(sectionHeader, addressTableChunks[0], firstAuxAddressTableChunk, firstImportedExportDirectoryChunk, importChunks[0], imageNameChunk);
 
   // Replace the large loader import directory created by the Driver on startup with a defined synthetic symbol pointing at the directory chunk
   Symbol *importDirectorySymbol = symtab.find("__large_loader_import_directory");
   if (!isa<DefinedSynthetic>(importDirectorySymbol))
     fatal("Large Loader import directory symbol has been replaced");
-  replaceSymbol<DefinedSynthetic>(importDirectorySymbol, importDirectorySymbol->getName(), importDirectoryChunk);
+  replaceSymbol<DefinedSynthetic>(importDirectorySymbol, importDirectorySymbol->getName(), symtab.largeLoaderImportSectionHeaderChunk);
 
   // Build the final contents of the future lidata section from the generated chunks
-  chunks.push_back(importDirectoryChunk);
+  chunks.push_back(symtab.largeLoaderImportSectionHeaderChunk);
   chunks.insert(chunks.end(), addressTableChunks.begin(), addressTableChunks.end());
   chunks.insert(chunks.end(), importedDllExportDirectoryChunks.begin(), importedDllExportDirectoryChunks.end());
   chunks.insert(chunks.end(), importChunks.begin(), importChunks.end());
@@ -1600,15 +1603,17 @@ void LargeLoaderExportDataContents::createLargeEdataChunks(SymbolTable &symtab, 
 
   // Create export section header now
   COFFLargeLoaderExportDirectory exportDirectory{};
-  exportDirectory.Version = LARGE_LOADER_VERSION_ARM64EC_EXPORTAS;
+  exportDirectory.Version = LARGE_LOADER_VERSION_CIRCULAR_DEPS;
   exportDirectory.HashingAlgorithm = hashingAlgo;
   exportDirectory.NumExportBuckets = static_cast<uint32_t>(exportHashBucketTableChunks.size());
   exportDirectory.NumExports = static_cast<uint32_t>(exportTableChunks.size());
   exportDirectory.SingleExportSize = static_cast<uint32_t>(exportTableChunks[0]->getSize());
   exportDirectory.ImageFilenameLength = static_cast<uint32_t>(imageNameChunk->getSize() - 1);
+  exportDirectory.ImportSectionHeaderLength = symtab.largeLoaderImportSectionHeaderChunk ? symtab.largeLoaderImportSectionHeaderChunk->getSize() : 0;
 
   Chunk *exportDirectoryChunk = make<LargeLoaderExportSectionHeaderChunk>(exportDirectory,
-    exportRVATableChunks[0], exportAuxRVATableChunks.empty() ? nullptr : exportAuxRVATableChunks[0], exportHashBucketTableChunks[0], exportTableChunks[0], imageNameChunk);
+    exportRVATableChunks[0], exportAuxRVATableChunks.empty() ? nullptr : exportAuxRVATableChunks[0], exportHashBucketTableChunks[0], exportTableChunks[0],
+    imageNameChunk, symtab.largeLoaderImportSectionHeaderChunk);
 
   // Replace the large loader export directory created by the Driver on startup with a defined synthetic symbol pointing at the start of the section
   Symbol *exportDirectorySymbol = symtab.find("__large_loader_export_directory");
