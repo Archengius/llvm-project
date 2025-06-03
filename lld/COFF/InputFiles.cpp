@@ -136,8 +136,15 @@ void ArchiveFile::parse() {
     iterator_range<Archive::symbol_iterator> symbols =
         CHECK(file->ec_symbols(), this);
     if (!symbols.empty()) {
-      for (const Archive::Symbol &sym : symbols)
+      for (const Archive::Symbol &sym : symbols) {
+        // Drop DllMain definition in Xinput.lib, DllMain should never be imported from other DLLs and due to symbol resolution
+        // priority differences between link.exe and lld-link.exe, taking this DllMain definition will result in it being prioritized
+        // over default DllMain from CRT, causing a double initialization crash in runtime when loading Xinput1_4.dll
+        // See the following issue for more information: https://github.com/llvm/llvm-project/issues/82050
+        if (sys::path::filename(getName()).equals_insensitive("Xinput.lib") && sym.getName().equals_insensitive("DllMain"))
+          continue;
         ctx.symtabEC->addLazyArchive(this, sym);
+      }
 
       // Read both EC and native symbols on ARM64X.
       if (!ctx.hybridSymtab)
@@ -184,8 +191,15 @@ void ArchiveFile::parse() {
   }
 
   // Read the symbol table to construct Lazy objects.
-  for (const Archive::Symbol &sym : file->symbols())
+  for (const Archive::Symbol &sym : file->symbols()) {
+    // Drop DllMain definition in Xinput.lib, DllMain should never be imported from other DLLs and due to symbol resolution
+    // priority differences between link.exe and lld-link.exe, taking this DllMain definition will result in it being prioritized
+    // over default DllMain from CRT, causing a double initialization crash in runtime when loading Xinput1_4.dll
+    // See the following issue for more information: https://github.com/llvm/llvm-project/issues/82050
+    if (sys::path::filename(getName()).equals_insensitive("Xinput.lib") && sym.getName().equals_insensitive("DllMain"))
+      continue;
     archiveSymtab->addLazyArchive(this, sym);
+  }
 }
 
 // Returns a buffer pointing to a member file containing a given symbol.
@@ -1247,6 +1261,13 @@ void ImportFile::parse() {
 
   this->hdr = hdr;
   externalName = extName;
+
+  // Drop DllMain definition in Xinput.lib, DllMain should never be imported from other DLLs and due to symbol resolution
+  // priority differences between link.exe and lld-link.exe, taking this DllMain definition will result in it being prioritized
+  // over default DllMain from CRT, causing a double initialization crash in runtime when loading Xinput1_4.dll
+  // See the following issue for more information: https://github.com/llvm/llvm-project/issues/82050
+  if (sys::path::filename(parentName).equals_insensitive("Xinput.lib") && name.equals_insensitive("DllMain"))
+    return;
 
   bool isCode = hdr->getType() == llvm::COFF::IMPORT_CODE;
 
