@@ -27,6 +27,8 @@
 #include "llvm/Support/Path.h"
 // <COFF_LARGE_EXPORTS>
 #include "CityHash.h"
+
+#include "llvm/ADT/StringExtras.h"
 #include "llvm/IR/Mangler.h"
 #include "llvm/Object/COFFLargeImport.h"
 // </COFF_LARGE_EXPORTS>
@@ -1201,7 +1203,15 @@ void LargeLoaderImportDataContents::setupLargeLoaderDllImportDependencies(Symbol
 
   // Create synthetic large loader imports for these DLLs
   for (const StringRef& dllName : sortedDllNames) {
-    createLargeLoaderDllImport(symtab, dllName);
+    // If DLL name is actually a name of the executable, do not create dynamic linker import for that executable,
+    // since executable images must never be loaded by the dynamic linker. Instead, we treat them as wildcard references
+    // to the main executable image of the process in runtime. This allows creation of shared objects that can link to a variety of executables,
+    // like LLVM plugins or Unreal Engine modules
+    if (dllName.ends_with_insensitive(".exe")) {
+      symtab.largeLoaderImportedExeNames.push_back(dllName);
+    } else {
+      createLargeLoaderDllImport(symtab, dllName);
+    }
   }
 }
 
@@ -1350,6 +1360,22 @@ void LargeLoaderImportDataContents::createLargeIdataChunks(SymbolTable &symtab, 
     Chunk* exportSectionStartAddressChunk = make<AbsoluteDefinedSymbolAddressChunk>(symtab, cast<Defined>(dllImportExportSectionStartSymbol));
     importedDllNameToExportSectionIndex[importedDllName] = importedDllExportDirectoryChunks.size();
     importedDllExportDirectoryChunks.push_back(exportSectionStartAddressChunk);
+  }
+
+  // Create a single empty export section slot for references to the process executable image
+  // Such references will not have an associated dynamic linker import
+  if (!symtab.largeLoaderImportedExeNames.empty()) {
+    // Null export directory slot will be resolved by the large loader as export directory of the process executable
+    const size_t mainProcessExecutableExportSlotIndex = importedDllExportDirectoryChunks.size();
+    importedDllExportDirectoryChunks.push_back(make<NullChunk>(symtab.ctx.config.wordsize, 8));
+
+    if (symtab.largeLoaderImportedExeNames.size() > 1) {
+      const std::string executableNames = join(symtab.largeLoaderImportedExeNames, ", ");
+      fatal("Attempting to link import libraries from multiple executable files " + executableNames + ". Dynamic libraries can only link against a single executable");
+    }
+    for (const StringRef &importedExeName : symtab.largeLoaderImportedExeNames) {
+      importedDllNameToExportSectionIndex[importedExeName] = mainProcessExecutableExportSlotIndex;
+    }
   }
 
   // Create address table chunk for each import

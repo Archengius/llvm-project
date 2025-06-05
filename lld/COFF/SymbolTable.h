@@ -169,6 +169,7 @@ public:
   // Import files for export directories of the DLLs imported by Large Loader
   std::map<StringRef, ImportFile*> largeLoaderDllImportFiles;
   std::vector<StringRef> largeLoaderImportedDllNames;
+  std::vector<StringRef> largeLoaderImportedExeNames;
   Chunk *largeLoaderImportSectionHeaderChunk{};
   // </COFF_LARGE_EXPORTS>
 
